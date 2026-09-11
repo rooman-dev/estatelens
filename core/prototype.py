@@ -5,6 +5,7 @@ writes them. Do not build on this file.
 
 Usage:
     python -m core.prototype <input_dir> <output_dir> [--half-size] [--no-align] [--dry-run]
+                             [--clahe-clip 2.0] [--saturation 1.25]
 """
 
 import argparse
@@ -23,6 +24,9 @@ TIFF_EXTS = {".tif", ".tiff"}  # synthetic test brackets; rawpy cannot read thes
 BRACKET_SIZE = 3
 GAP_SECONDS = 3.0
 JPEG_QUALITY = 95
+CLAHE_CLIP = 2.0
+CLAHE_TILES = (8, 8)
+SATURATION = 1.25
 
 
 def read_exif(path):
@@ -127,7 +131,29 @@ def align(images):
             for i, img in enumerate(images)]
 
 
-def fuse_bracket(bracket, out_path, half_size, do_align):
+def enhance(img, clahe_clip=CLAHE_CLIP, saturation=SATURATION):
+    """Local contrast (CLAHE on L in LAB), then saturation boost (S in HSV).
+
+    Takes and returns 8-bit RGB. clahe_clip=0 or saturation=1.0 skips that step.
+    """
+    if clahe_clip > 0:
+        # Only lightness is equalised, so colours don't shift. Must be 8-bit:
+        # CLAHE rejects float, and OpenCV's LAB conversion has no 16-bit mode.
+        lab = cv2.cvtColor(img, cv2.COLOR_RGB2LAB)
+        clahe = cv2.createCLAHE(clipLimit=clahe_clip, tileGridSize=CLAHE_TILES)
+        lab[:, :, 0] = clahe.apply(lab[:, :, 0])
+        img = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
+    if saturation != 1.0:
+        hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV)
+        # Multiply in float: in uint8, 220 * 1.25 would wrap around to 19.
+        s = hsv[:, :, 1].astype(np.float32) * saturation
+        hsv[:, :, 1] = np.clip(s, 0, 255).astype(np.uint8)
+        img = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
+    return img
+
+
+def fuse_bracket(bracket, out_path, half_size, do_align,
+                 clahe_clip=CLAHE_CLIP, saturation=SATURATION):
     images = [load_image(f["path"], half_size) for f in bracket]
     if len({img.shape for img in images}) != 1:
         raise ValueError("frames have different sizes")
@@ -135,6 +161,7 @@ def fuse_bracket(bracket, out_path, half_size, do_align):
         images = align(images)
     fused = cv2.createMergeMertens().process(images)
     out = np.clip(fused * 255, 0, 255).astype(np.uint8)
+    out = enhance(out, clahe_clip, saturation)
     if not cv2.imwrite(str(out_path), cv2.cvtColor(out, cv2.COLOR_RGB2BGR),
                        [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY]):
         raise OSError(f"could not write {out_path}")
@@ -147,7 +174,13 @@ def main():
     parser.add_argument("--half-size", action="store_true", help="decode at half resolution (faster, ~4x less memory)")
     parser.add_argument("--no-align", action="store_true", help="skip alignment (tripod shots)")
     parser.add_argument("--dry-run", action="store_true", help="print the groups without fusing")
+    parser.add_argument("--clahe-clip", type=float, default=CLAHE_CLIP,
+                        help=f"CLAHE clip limit on lightness, 0 to disable (default {CLAHE_CLIP})")
+    parser.add_argument("--saturation", type=float, default=SATURATION,
+                        help=f"saturation multiplier, 1.0 to disable (default {SATURATION})")
     args = parser.parse_args()
+    if args.clahe_clip < 0 or args.saturation < 0:
+        parser.error("--clahe-clip and --saturation must not be negative")
 
     if not args.input_dir.is_dir():
         sys.exit(f"error: {args.input_dir} is not a folder")
@@ -183,7 +216,8 @@ def main():
 
         start = time.perf_counter()
         try:
-            fuse_bracket(bracket, out_path, args.half_size, not args.no_align)
+            fuse_bracket(bracket, out_path, args.half_size, not args.no_align,
+                         args.clahe_clip, args.saturation)
         except Exception as e:  # prototype: report and keep going
             print(f"{prefix} -> FAILED: {e}")
             failed += 1
