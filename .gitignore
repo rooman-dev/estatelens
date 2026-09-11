@@ -1,0 +1,23 @@
+# Environments and caches
+venv/
+__pycache__/
+*.pyc
+
+# Test images live in data/ locally and are never committed
+data/
+
+# Image files (patterns are case-insensitive so they work on every machine)
+*.[jJ][pP][gG]
+*.[jJ][pP][eE][gG]
+*.[pP][nN][gG]
+*.[tT][iI][fF]
+*.[tT][iI][fF][fF]
+*.[cC][rR]2
+*.[cC][rR]3
+*.[nN][eE][fF]
+*.[aA][rR][wW]
+*.[dD][nN][gG]
+
+# Exceptions: UI assets and report figures are committed
+!ui/assets/**
+!eval/figures/**
