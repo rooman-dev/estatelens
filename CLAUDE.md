@@ -22,35 +22,34 @@ ERRORS: <any errors, or "none">
 
 ## Stack
 
-- Python 3.14. Everyone on the team uses 3.14; the pins in requirements.txt
-  are tested on it, and other versions may not install them.
-- PySide6 (UI), OpenCV, rawpy, numpy
+- Python 3.14. The pins in requirements.txt are tested on it, and other
+  versions may not install them.
+- PySide6 (UI), OpenCV, rawpy, numpy, PyTorch + torchvision (sky model)
 - SQLite via the standard library `sqlite3` module (not in requirements.txt)
 
 Setup: `py -3.14 -m venv venv`, activate it, then `pip install -r requirements.txt`.
 
-## Folder ownership
+## Folder structure
 
-Ownership is strict. Do not create or edit files in a folder the current user
-does not own. If a change is needed there, write it up as a proposal for the owner.
+All nine modules are built by one person; folders organise code, not ownership.
 
-| Folder        | Owner  | Contents                                   |
-|---------------|--------|--------------------------------------------|
-| `core/`       | Rooman | Pipeline runner, job scheduling            |
-| `ui/`         | Rooman | PySide6 interface                          |
-| `processing/` | Hadeed | RAW loading, HDR fusion, perspective       |
-| `models/`     | Arham  | Sky segmentation model                     |
-| `eval/`       | Arham  | Benchmarks and metrics                     |
-| `data/`       | -      | Test images. Never committed               |
+| Folder        | Contents                                   |
+|---------------|--------------------------------------------|
+| `core/`       | Pipeline runner, job scheduling            |
+| `ui/`         | PySide6 interface                          |
+| `processing/` | RAW loading, HDR fusion, perspective       |
+| `models/`     | Sky segmentation model                     |
+| `eval/`       | Benchmarks and metrics                     |
+| `data/`       | Test images and datasets. Never committed  |
 
-`data/` is gitignored, so it does not exist after cloning. Each person creates
-it locally and puts their own test images in it.
+`data/` is gitignored, so it does not exist after cloning. Create it locally
+and put test images and downloaded datasets in it.
 
 ## Prototype vs. real implementation
 
-`core/prototype.py` is Rooman's throwaway end-to-end prototype (RAW loading and
-bracket fusion). It exists only to prove the pipeline works. Hadeed writes the
-real versions in `processing/`:
+`core/prototype.py` is a throwaway end-to-end prototype (RAW loading and
+bracket fusion). It exists only to prove the pipeline works. The real
+versions go in `processing/`:
 
 - `processing/chromaraw.py`: RAW loading
 - `processing/lumamerge.py`: HDR fusion
