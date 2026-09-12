@@ -5,7 +5,7 @@ writes them. Do not build on this file.
 
 Usage:
     python -m core.prototype <input_dir> <output_dir> [--half-size] [--no-align] [--dry-run]
-                             [--clahe-clip 2.0] [--saturation 1.25]
+                             [--no-perspective] [--clahe-clip 2.0] [--saturation 1.25]
 """
 
 import argparse
@@ -18,6 +18,8 @@ import cv2
 import exifread
 import numpy as np
 import rawpy
+
+from core.truevertical import correct_perspective_with_diagnostics
 
 RAW_EXTS = {".cr2", ".nef", ".arw", ".dng"}
 TIFF_EXTS = {".tif", ".tiff"}  # synthetic test brackets; rawpy cannot read these
@@ -152,8 +154,9 @@ def enhance(img, clahe_clip=CLAHE_CLIP, saturation=SATURATION):
     return img
 
 
-def fuse_bracket(bracket, out_path, half_size, do_align,
+def fuse_bracket(bracket, out_path, half_size, do_align, do_perspective=True,
                  clahe_clip=CLAHE_CLIP, saturation=SATURATION):
+    """Fuse one bracket and write a JPEG. Returns a note about the perspective step, or None."""
     images = [load_image(f["path"], half_size) for f in bracket]
     if len({img.shape for img in images}) != 1:
         raise ValueError("frames have different sizes")
@@ -161,10 +164,19 @@ def fuse_bracket(bracket, out_path, half_size, do_align,
         images = align(images)
     fused = cv2.createMergeMertens().process(images)
     out = np.clip(fused * 255, 0, 255).astype(np.uint8)
+    note = None
+    if do_perspective:
+        # truevertical only uses the image for grayscale edge detection and a
+        # channel-agnostic warp, so it is happy with RGB. It declines images it
+        # cannot correct and returns them unchanged; say so instead of going quiet.
+        out, diag = correct_perspective_with_diagnostics(out)
+        note = (f"perspective {diag['correction_deg']:.1f} deg"
+                if diag["applied"] else f"no perspective ({diag['reason']})")
     out = enhance(out, clahe_clip, saturation)
     if not cv2.imwrite(str(out_path), cv2.cvtColor(out, cv2.COLOR_RGB2BGR),
                        [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY]):
         raise OSError(f"could not write {out_path}")
+    return note
 
 
 def main():
@@ -174,6 +186,8 @@ def main():
     parser.add_argument("--half-size", action="store_true", help="decode at half resolution (faster, ~4x less memory)")
     parser.add_argument("--no-align", action="store_true", help="skip alignment (tripod shots)")
     parser.add_argument("--dry-run", action="store_true", help="print the groups without fusing")
+    parser.add_argument("--no-perspective", action="store_true",
+                        help="skip perspective correction (on by default)")
     parser.add_argument("--clahe-clip", type=float, default=CLAHE_CLIP,
                         help=f"CLAHE clip limit on lightness, 0 to disable (default {CLAHE_CLIP})")
     parser.add_argument("--saturation", type=float, default=SATURATION,
@@ -216,13 +230,14 @@ def main():
 
         start = time.perf_counter()
         try:
-            fuse_bracket(bracket, out_path, args.half_size, not args.no_align,
-                         args.clahe_clip, args.saturation)
+            note = fuse_bracket(bracket, out_path, args.half_size, not args.no_align,
+                                not args.no_perspective, args.clahe_clip, args.saturation)
         except Exception as e:  # prototype: report and keep going
             print(f"{prefix} -> FAILED: {e}")
             failed += 1
             continue
-        print(f"{prefix} -> {out_path.name} ({time.perf_counter() - start:.1f}s)")
+        suffix = f" | {note}" if note else ""
+        print(f"{prefix} -> {out_path.name} ({time.perf_counter() - start:.1f}s){suffix}")
         done += 1
 
     if not args.dry_run:
