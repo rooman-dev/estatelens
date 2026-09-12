@@ -77,7 +77,8 @@ CREATE TABLE IF NOT EXISTS memory_benchmarks (
     width              INTEGER,
     height             INTEGER,
     baseline_memory_mb REAL,                -- RSS after imports, before fusion
-    peak_memory_mb     REAL,
+    peak_memory_mb     REAL,                -- peak RSS: understates need once Windows starts paging
+    peak_commit_mb     REAL,                -- peak private bytes: the real requirement
     wall_seconds       REAL,
     error              TEXT,
     timestamp          TEXT NOT NULL
@@ -94,6 +95,10 @@ def connect(db_path):
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
+    # CREATE TABLE IF NOT EXISTS leaves older databases without later columns.
+    columns = {r["name"] for r in conn.execute("PRAGMA table_info(memory_benchmarks)")}
+    if "peak_commit_mb" not in columns:
+        conn.execute("ALTER TABLE memory_benchmarks ADD COLUMN peak_commit_mb REAL")
     return conn
 
 
@@ -155,33 +160,49 @@ def enqueue_folder(conn, input_dir, output_dir, settings):
 
 
 class PeakMemory:
-    """Track the highest process memory (RSS) while the `with` block runs.
+    """Track the highest process memory while the `with` block runs.
 
     psutil only reports current memory, and Windows' own peak counter covers the
     whole process lifetime, so a background thread samples every 20 ms instead.
-    RSS includes OpenCV's C++ buffers, which Python's tracemalloc cannot see.
+    Both counters include OpenCV's C++ buffers, which Python's tracemalloc cannot see.
+
+    Two counters, because they diverge under memory pressure:
+    - RSS (working set) is what sits in RAM. When RAM runs short Windows pages
+      memory out to the pagefile, so RSS under-reports what the job needs.
+    - Commit (private bytes) is what the process has allocated, in RAM or paged
+      out. This is the real memory requirement. Falls back to RSS off Windows.
     """
 
     def __enter__(self):
         self._process = psutil.Process()
-        self.peak = self._process.memory_info().rss
+        self.peak = self.peak_commit = 0
+        self._update()
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._sample, daemon=True)
         self._thread.start()
         return self
 
+    def _update(self):
+        info = self._process.memory_info()
+        self.peak = max(self.peak, info.rss)
+        self.peak_commit = max(self.peak_commit, getattr(info, "private", info.rss))
+
     def _sample(self):
         while not self._stop.wait(MEMORY_SAMPLE_SECONDS):
-            self.peak = max(self.peak, self._process.memory_info().rss)
+            self._update()
 
     def __exit__(self, *exc_info):
         self._stop.set()
         self._thread.join()
-        self.peak = max(self.peak, self._process.memory_info().rss)
+        self._update()
 
     @property
     def peak_mb(self):
         return self.peak / 2**20
+
+    @property
+    def peak_commit_mb(self):
+        return self.peak_commit / 2**20
 
 
 def frame_from_path(path):
@@ -315,7 +336,7 @@ def process_pending(conn):
 
 
 def benchmark_child(files, out_path, settings, tile_size, results):
-    """Runs in a fresh process, so the RSS peak belongs to this one fusion alone."""
+    """Runs in a fresh process, so the memory peaks belong to this one fusion alone."""
     try:
         bracket = [frame_from_path(Path(p)) for p in files]
         baseline = psutil.Process().memory_info().rss / 2**20
@@ -325,7 +346,8 @@ def benchmark_child(files, out_path, settings, tile_size, results):
                 bracket, out_path, settings["half_size"], settings["align"],
                 settings["clahe_clip"], settings["saturation"], tile_size, settings["overlap"])
         results.put({"tiles": tiles, "width": width, "height": height, "baseline_memory_mb": baseline,
-                     "peak_memory_mb": memory.peak_mb, "wall_seconds": time.perf_counter() - start})
+                     "peak_memory_mb": memory.peak_mb, "peak_commit_mb": memory.peak_commit_mb,
+                     "wall_seconds": time.perf_counter() - start})
     except Exception as e:
         results.put({"error": str(e)})
 
@@ -361,18 +383,17 @@ def compare_tiling(conn, input_dir, output_dir, settings):
         with conn:
             conn.execute(
                 "INSERT INTO memory_benchmarks (bracket_files, mode, tile_size, overlap, tiles, width, height, "
-                "baseline_memory_mb, peak_memory_mb, wall_seconds, error, timestamp) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "baseline_memory_mb, peak_memory_mb, peak_commit_mb, wall_seconds, error, timestamp) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (json.dumps(files), mode, tile_size, settings["overlap"], result.get("tiles"), result.get("width"),
                  result.get("height"), result.get("baseline_memory_mb"), result.get("peak_memory_mb"),
-                 result.get("wall_seconds"), result.get("error"), now()))
+                 result.get("peak_commit_mb"), result.get("wall_seconds"), result.get("error"), now()))
         if "error" in result:
             print(f"  {mode:<5} FAILED: {result['error']}")
             continue
         outputs[mode] = out_path
         print(f"  {mode:<5} {result['width']}x{result['height']}, {result['tiles']} tile(s): "
-              f"peak {result['peak_memory_mb']:.0f} MB "
-              f"(fusion added {result['peak_memory_mb'] - result['baseline_memory_mb']:.0f} MB), "
+              f"peak commit {result['peak_commit_mb']:.0f} MB, peak RSS {result['peak_memory_mb']:.0f} MB, "
               f"{result['wall_seconds']:.1f}s -> {out_path.name}")
 
     if len(outputs) == 2:
@@ -399,7 +420,8 @@ def print_history(conn):
         else:
             print(f"  {r['timestamp']}  {name}  {r['mode']:<5} {r['width']}x{r['height']}  "
                   f"tile {r['tile_size']}/{r['overlap']}, {r['tiles']} tile(s)  "
-                  f"peak {r['peak_memory_mb']:.0f} MB  {r['wall_seconds']:.1f}s")
+                  f"commit {r['peak_commit_mb'] or 0:.0f} MB  RSS {r['peak_memory_mb']:.0f} MB  "
+                  f"{r['wall_seconds']:.1f}s")
 
 
 def main():
