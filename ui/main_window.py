@@ -23,8 +23,8 @@ from PySide6.QtWidgets import (
 )
 
 from core.prototype import (
-    JPEG_EXTS, TIFF_EXTS, brightness, describe_exposure, find_frames, fuse_bracket,
-    group_brackets,
+    JPEG_EXTS, TIFF_EXTS, brightness, describe_exposure, exposure_order, find_frames,
+    fuse_bracket, group_brackets,
 )
 
 WARNING_COLOR = QColor("#b36b00")
@@ -228,7 +228,7 @@ class FuseWorker(QObject):
                 break
             # Same ordering as prototype.main(): dark to bright when EXIF allows it.
             if all(brightness(f) is not None for f in bracket):
-                bracket = sorted(bracket, key=brightness)
+                bracket = sorted(bracket, key=exposure_order)
             # Only here is the bracket in exposure order, so only here do we know
             # which frame is the normal exposure. Tell the UI rather than let it guess.
             middle_path = bracket[len(bracket) // 2]["path"]
@@ -376,7 +376,7 @@ class MainWindow(QMainWindow):
         for w in warnings:
             self.add_item(f"⚠ {w}", WARNING_COLOR)
         for i, bracket in enumerate(brackets, 1):
-            exposures = " ".join(describe_exposure(f) for f in bracket)
+            exposures = ", ".join(describe_exposure(f, bracket) for f in bracket)
             # Tag the header and its file rows with the bracket index, so clicking
             # either one selects the same preview. Warning rows stay untagged.
             self.bracket_items.append(self.add_item(f"Bracket {i}  ({exposures})", index=i - 1))

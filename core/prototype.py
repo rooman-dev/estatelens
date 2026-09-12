@@ -51,11 +51,22 @@ def read_exif(path):
     return timestamp, number("EXIF ExposureTime"), number("EXIF FNumber"), number("EXIF ISOSpeedRatings")
 
 
-def describe_exposure(frame):
-    if frame["exposure"] is None:
-        return "?"
+def describe_exposure(frame, bracket=None):
+    """Shutter speed, plus aperture and ISO when they vary across `bracket`.
+
+    Without a bracket only the shutter is shown, as before. With one, a bracket
+    shot by changing ISO or aperture no longer reads as "1/60 1/60 1/60".
+    """
     t = frame["exposure"]
-    return f"1/{round(1 / t)}" if t < 1 else f"{t:g}s"
+    parts = ["?" if t is None else f"1/{round(1 / t)}" if t < 1 else f"{t:g}s"]
+    if bracket is not None:
+        if len({f["f_number"] for f in bracket}) > 1:
+            n = frame["f_number"]
+            parts.append("f/?" if n is None else f"f/{n:g}")
+        if len({f["iso"] for f in bracket}) > 1:
+            iso = frame["iso"]
+            parts.append("ISO?" if iso is None else f"ISO{iso:g}")
+    return " ".join(parts)
 
 
 def brightness(frame):
@@ -63,6 +74,11 @@ def brightness(frame):
     if None in (frame["exposure"], frame["f_number"], frame["iso"]):
         return None
     return frame["exposure"] * frame["iso"] / frame["f_number"] ** 2
+
+
+def exposure_order(frame):
+    """Sort key: dark to bright, then filename when exposures are genuinely identical."""
+    return brightness(frame), frame["path"].name
 
 
 def find_frames(folder):
@@ -218,13 +234,13 @@ def main():
     for i, bracket in enumerate(brackets, 1):
         # Order dark to bright when EXIF allows it; otherwise keep capture/filename order.
         if all(brightness(f) is not None for f in bracket):
-            bracket = sorted(bracket, key=brightness)
+            bracket = sorted(bracket, key=exposure_order)
             if len({brightness(f) for f in bracket}) == 1:
                 print(f"WARNING: bracket {i} has identical exposures; may not be a real bracket")
 
         out_path = args.output_dir / f"{bracket[0]['path'].stem}_fused.jpg"
         names = " ".join(f["path"].name for f in bracket)
-        exposures = " ".join(describe_exposure(f) for f in bracket)
+        exposures = ", ".join(describe_exposure(f, bracket) for f in bracket)
         prefix = f"[{i}/{len(brackets)}] {names} | {exposures}"
 
         if args.dry_run:
