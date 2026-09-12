@@ -24,7 +24,9 @@ from core.truevertical import correct_perspective_with_diagnostics
 RAW_EXTS = {".cr2", ".nef", ".arw", ".dng"}
 TIFF_EXTS = {".tif", ".tiff"}  # synthetic test brackets; rawpy cannot read these
 BRACKET_SIZE = 3
-GAP_SECONDS = 3.0
+# Frames this close together belong to one bracket. Commercial HDR systems allow
+# up to 90s; 3s used to split tripod brackets shot at a slower pace.
+GAP_SECONDS = 30.0
 JPEG_QUALITY = 95
 CLAHE_CLIP = 1.5
 CLAHE_TILES = (8, 8)
