@@ -175,8 +175,9 @@ def run_job(conn, job):
         bracket = [frame_from_path(p) for p in files]
         output_path.parent.mkdir(parents=True, exist_ok=True)
         with memory:
+            # Keywords, not positions: fuse_bracket has do_perspective before these.
             fuse_bracket(bracket, output_path, settings["half_size"], settings["align"],
-                         settings["clahe_clip"], settings["saturation"])
+                         clahe_clip=settings["clahe_clip"], saturation=settings["saturation"])
     except Exception as e:
         wall = time.perf_counter() - start
         peak = memory.peak_mb if hasattr(memory, "peak") else None
