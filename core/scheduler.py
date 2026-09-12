@@ -47,6 +47,11 @@ TILE_SIZE = 2048
 # Large overlap because Mertens' coarse pyramid levels see far beyond a tile's edge,
 # so neighbouring tiles differ in low-frequency brightness near their borders.
 OVERLAP = 256
+# Tiles take their broad tone from a whole-image Mertens run at 1/GUIDE_FACTOR size.
+# Fused alone, each tile weights exposures by its own content (all sky vs. mostly
+# ground), which left a visible band in the Ladakh Valley sky that feathering
+# could not hide. At 1/8 the guide added ~93 MB transiently on a 36 MP bracket.
+GUIDE_FACTOR = 8
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
@@ -232,17 +237,39 @@ def feather(length, start, stop, overlap):
     return weights
 
 
-def mertens(images, tile_size, overlap):
+def guide_crop(guide, x, y, tile_w, tile_h, small_w, small_h, width, height):
+    """Resample the region of `guide` under a tile onto the tile's small (small_w x small_h) grid.
+
+    Pixel centres are mapped exactly, so the crop lines up with cv2.resize of the
+    tile even though tile edges rarely fall on whole guide pixels.
+    """
+    gh, gw = guide.shape[:2]
+    sx, sy = tile_w / small_w * gw / width, tile_h / small_h * gh / height
+    ox = (x + 0.5 * tile_w / small_w) * gw / width - 0.5
+    oy = (y + 0.5 * tile_h / small_h) * gh / height - 0.5
+    matrix = np.float32([[sx, 0, ox], [0, sy, oy]])
+    return cv2.warpAffine(guide, matrix, (small_w, small_h),
+                          flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP, borderMode=cv2.BORDER_REPLICATE)
+
+
+def mertens(images, tile_size, overlap, guide_factor=GUIDE_FACTOR):
     """Mertens fusion, tile by tile when the image is larger than one tile.
 
-    Returns (fused float32 image, number of tiles). Each tile's fused result is
-    weighted by its feather mask and accumulated; dividing by the summed weights
-    makes overlaps a smooth blend however the tiles happen to line up.
+    Returns (fused float32 image, number of tiles). Each fused tile has its low
+    frequencies swapped for those of a downscaled whole-image fusion (the guide),
+    so all tiles agree on overall tone. It is then weighted by its feather mask and
+    accumulated; dividing by the summed weights makes overlaps a smooth blend
+    however the tiles happen to line up.
     """
     height, width = images[0].shape[:2]
     merge = cv2.createMergeMertens()
     if tile_size == 0 or (height <= tile_size and width <= tile_size):
         return merge.process(images), 1
+
+    small = [cv2.resize(img, None, fx=1 / guide_factor, fy=1 / guide_factor, interpolation=cv2.INTER_AREA)
+             for img in images]
+    guide = merge.process(small)
+    del small
 
     accum = np.zeros((height, width, 3), np.float32)
     weight_sum = np.zeros((height, width), np.float32)
@@ -257,6 +284,12 @@ def mertens(images, tile_size, overlap):
             tiles = [np.ascontiguousarray(img[y:y_end, x:x_end]) for img in images]
             fused = merge.process(tiles)
             del tiles  # only this tile's data lives beyond this point, and not for long
+            tile_w, tile_h = x_end - x, y_end - y
+            small_w, small_h = -(-tile_w // guide_factor), -(-tile_h // guide_factor)  # ceil
+            fused_small = cv2.resize(fused, (small_w, small_h), interpolation=cv2.INTER_AREA)
+            correction = guide_crop(guide, x, y, tile_w, tile_h, small_w, small_h, width, height) - fused_small
+            # Cubic keeps the 8x-upsampled correction smooth (linear has slope kinks every 8 px).
+            fused += cv2.resize(correction, (tile_w, tile_h), interpolation=cv2.INTER_CUBIC)
             accum[y:y_end, x:x_end] += fused * weight[:, :, None]
             weight_sum[y:y_end, x:x_end] += weight
             del fused
