@@ -23,6 +23,7 @@ from core.truevertical import correct_perspective_with_diagnostics
 
 RAW_EXTS = {".cr2", ".nef", ".arw", ".dng"}
 TIFF_EXTS = {".tif", ".tiff"}  # synthetic test brackets; rawpy cannot read these
+JPEG_EXTS = {".jpg", ".jpeg"}  # already-developed frames; read with OpenCV, not rawpy
 BRACKET_SIZE = 3
 # Frames this close together belong to one bracket. Commercial HDR systems allow
 # up to 90s; 3s used to split tripod brackets shot at a slower pace.
@@ -67,7 +68,7 @@ def brightness(frame):
 def find_frames(folder):
     frames = []
     for path in sorted(folder.iterdir()):
-        if path.suffix.lower() in RAW_EXTS | TIFF_EXTS:
+        if path.suffix.lower() in RAW_EXTS | TIFF_EXTS | JPEG_EXTS:
             timestamp, exposure, f_number, iso = read_exif(path)
             frames.append({"path": path, "timestamp": timestamp,
                            "exposure": exposure, "f_number": f_number, "iso": iso})
@@ -109,7 +110,7 @@ def group_brackets(frames):
 
 def load_image(path, half_size):
     """Return an RGB float32 image scaled to 0-255, the range MergeMertens expects."""
-    if path.suffix.lower() in TIFF_EXTS:
+    if path.suffix.lower() in TIFF_EXTS | JPEG_EXTS:
         img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
         if img is None:
             raise ValueError("OpenCV could not read the file")
@@ -203,7 +204,7 @@ def main():
 
     frames = find_frames(args.input_dir)
     if not frames:
-        sys.exit(f"error: no RAW or TIFF files in {args.input_dir}")
+        sys.exit(f"error: no RAW, TIFF or JPEG files in {args.input_dir}")
 
     brackets, warnings = group_brackets(frames)
     for w in warnings:

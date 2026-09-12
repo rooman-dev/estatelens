@@ -23,7 +23,8 @@ from PySide6.QtWidgets import (
 )
 
 from core.prototype import (
-    TIFF_EXTS, brightness, describe_exposure, find_frames, fuse_bracket, group_brackets,
+    JPEG_EXTS, TIFF_EXTS, brightness, describe_exposure, find_frames, fuse_bracket,
+    group_brackets,
 )
 
 WARNING_COLOR = QColor("#b36b00")
@@ -48,7 +49,9 @@ def load_before_image(path, half_size=True):
     the same ~1% histogram stretch and sRGB gamma (2.222, 4.5) a camera applies to
     its own JPEG. Camera white balance matches what fusion used.
     """
-    if path.suffix.lower() in TIFF_EXTS:
+    # TIFF and JPEG are already developed, so they need no rendering decisions:
+    # what is in the file is what the camera (or the previous tool) produced.
+    if path.suffix.lower() in TIFF_EXTS | JPEG_EXTS:
         img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
         if img is None:
             raise ValueError(f"could not read {path.name}")
