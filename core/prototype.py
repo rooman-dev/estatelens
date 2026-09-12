@@ -5,7 +5,7 @@ writes them. Do not build on this file.
 
 Usage:
     python -m core.prototype <input_dir> <output_dir> [--half-size] [--no-align] [--dry-run]
-                             [--no-perspective] [--clahe-clip 2.0] [--saturation 1.25]
+                             [--no-perspective] [--clahe-clip 1.5] [--saturation 1.1]
 """
 
 import argparse
@@ -26,9 +26,9 @@ TIFF_EXTS = {".tif", ".tiff"}  # synthetic test brackets; rawpy cannot read thes
 BRACKET_SIZE = 3
 GAP_SECONDS = 3.0
 JPEG_QUALITY = 95
-CLAHE_CLIP = 2.0
+CLAHE_CLIP = 1.5
 CLAHE_TILES = (8, 8)
-SATURATION = 1.25
+SATURATION = 1.1
 
 
 def read_exif(path):
