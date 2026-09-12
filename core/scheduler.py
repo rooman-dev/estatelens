@@ -8,26 +8,45 @@ reset to 'pending' and processed along with everything else still pending.
 Assumes one scheduler process at a time (no lock file, by design: a stale lock
 after a crash would block the recovery this module exists for).
 
+Tiled fusion (stopgap until processing/lumamerge.py exists): Mertens' weight maps
+and pyramids, not the decoded frames, are the memory peak, so large images are
+fused in overlapping tiles and feathered back together. Frames are still decoded
+whole, so their memory is not reduced; disk-backed frames (np.memmap) would cut
+that too and are left as future work. --compare-tiling fuses one bracket both
+ways, each in a fresh process, and records peak memory for the two runs.
+
 Usage:
     python -m core.scheduler [input_dir output_dir] [--db data/estatelens.db]
                              [--half-size] [--no-align] [--clahe-clip 2.0] [--saturation 1.25]
-                             [--retry-failed] [--history]
+                             [--tile-size 2048] [--overlap 256]
+                             [--retry-failed] [--history] [--compare-tiling]
 """
 
 import argparse
 import json
+import multiprocessing
+import queue
 import sqlite3
 import threading
 import time
 from datetime import datetime
 from pathlib import Path
 
+import cv2
+import numpy as np
 import psutil
 
-from core.prototype import CLAHE_CLIP, SATURATION, brightness, find_frames, fuse_bracket, group_brackets, read_exif
+from core.prototype import (CLAHE_CLIP, JPEG_QUALITY, SATURATION, align, brightness, enhance, find_frames,
+                            group_brackets, load_image, read_exif)
+from core.truevertical import correct_perspective_with_diagnostics
 
 DEFAULT_DB = Path("data/estatelens.db")
 MEMORY_SAMPLE_SECONDS = 0.02
+# Tile edge in pixels; 0 disables tiling. An image that fits in one tile is fused whole.
+TILE_SIZE = 2048
+# Large overlap because Mertens' coarse pyramid levels see far beyond a tile's edge,
+# so neighbouring tiles differ in low-frequency brightness near their borders.
+OVERLAP = 256
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
@@ -36,7 +55,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     status         TEXT NOT NULL CHECK (status IN ('pending', 'running', 'complete', 'failed')),
     output_path    TEXT NOT NULL,          -- planned at creation; the file exists only once 'complete'
     created_at     TEXT NOT NULL,
-    settings       TEXT NOT NULL,          -- JSON: half_size, align, clahe_clip, saturation
+    settings       TEXT NOT NULL,          -- JSON: half_size, align, clahe_clip, saturation, tile_size, overlap
     error          TEXT,
     wall_seconds   REAL,
     peak_memory_mb REAL
@@ -47,6 +66,21 @@ CREATE TABLE IF NOT EXISTS runs (
     old_status TEXT,                        -- NULL when the job is created
     new_status TEXT NOT NULL,
     timestamp  TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS memory_benchmarks (
+    bench_id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    bracket_files      TEXT NOT NULL,       -- JSON list, same format as jobs.bracket_files
+    mode               TEXT NOT NULL CHECK (mode IN ('whole', 'tiled')),
+    tile_size          INTEGER NOT NULL,
+    overlap            INTEGER NOT NULL,
+    tiles              INTEGER,             -- 1 for whole-image fusion
+    width              INTEGER,
+    height             INTEGER,
+    baseline_memory_mb REAL,                -- RSS after imports, before fusion
+    peak_memory_mb     REAL,
+    wall_seconds       REAL,
+    error              TEXT,
+    timestamp          TEXT NOT NULL
 );
 """
 
@@ -156,6 +190,86 @@ def frame_from_path(path):
     return {"path": path, "timestamp": timestamp, "exposure": exposure, "f_number": f_number, "iso": iso}
 
 
+def tile_starts(length, tile_size, overlap):
+    """Tile start offsets along one axis. Neighbours overlap by at least `overlap`;
+    the last tile is pushed back to end flush with the image, so its overlap can be larger."""
+    if length <= tile_size:
+        return [0]
+    stride = tile_size - overlap
+    return list(range(0, length - tile_size, stride)) + [length - tile_size]
+
+
+def feather(length, start, stop, overlap):
+    """1-D weights for a tile covering [start, stop): raised-cosine ramps on sides
+    that have a neighbour, flat 1 on sides at the image edge."""
+    weights = np.ones(stop - start, np.float32)
+    ramp = (0.5 - 0.5 * np.cos(np.pi * (np.arange(overlap) + 0.5) / overlap)).astype(np.float32)
+    if start > 0:
+        weights[:overlap] = ramp
+    if stop < length:
+        weights[-overlap:] = np.minimum(weights[-overlap:], ramp[::-1])
+    return weights
+
+
+def mertens(images, tile_size, overlap):
+    """Mertens fusion, tile by tile when the image is larger than one tile.
+
+    Returns (fused float32 image, number of tiles). Each tile's fused result is
+    weighted by its feather mask and accumulated; dividing by the summed weights
+    makes overlaps a smooth blend however the tiles happen to line up.
+    """
+    height, width = images[0].shape[:2]
+    merge = cv2.createMergeMertens()
+    if tile_size == 0 or (height <= tile_size and width <= tile_size):
+        return merge.process(images), 1
+
+    accum = np.zeros((height, width, 3), np.float32)
+    weight_sum = np.zeros((height, width), np.float32)
+    ys, xs = tile_starts(height, tile_size, overlap), tile_starts(width, tile_size, overlap)
+    for y in ys:
+        y_end = min(y + tile_size, height)
+        wy = feather(height, y, y_end, overlap)
+        for x in xs:
+            x_end = min(x + tile_size, width)
+            weight = np.outer(wy, feather(width, x, x_end, overlap))
+            # Contiguous copies: OpenCV rejects or silently copies strided views anyway.
+            tiles = [np.ascontiguousarray(img[y:y_end, x:x_end]) for img in images]
+            fused = merge.process(tiles)
+            del tiles  # only this tile's data lives beyond this point, and not for long
+            accum[y:y_end, x:x_end] += fused * weight[:, :, None]
+            weight_sum[y:y_end, x:x_end] += weight
+            del fused
+    accum /= weight_sum[:, :, None]
+    return accum, len(ys) * len(xs)
+
+
+def fuse_bracket_tiled(bracket, out_path, half_size, do_align, clahe_clip, saturation, tile_size, overlap):
+    """prototype.fuse_bracket with tiled Mertens; every other step is the same and runs on the whole image.
+
+    Alignment, perspective and CLAHE are global operations, so they must never run
+    per tile. Returns (perspective note, (width, height), number of tiles).
+    Stopgap: keep in step with prototype.fuse_bracket until lumamerge replaces both.
+    """
+    images = [load_image(f["path"], half_size) for f in bracket]
+    if len({img.shape for img in images}) != 1:
+        raise ValueError("frames have different sizes")
+    if do_align:
+        images = align(images)
+    height, width = images[0].shape[:2]
+    fused, tiles = mertens(images, tile_size, overlap)
+    del images
+    out = np.clip(fused * 255, 0, 255).astype(np.uint8)
+    del fused
+    out, diag = correct_perspective_with_diagnostics(out)
+    note = (f"perspective {diag['correction_deg']:.1f} deg"
+            if diag["applied"] else f"no perspective ({diag['reason']})")
+    out = enhance(out, clahe_clip, saturation)
+    if not cv2.imwrite(str(out_path), cv2.cvtColor(out, cv2.COLOR_RGB2BGR),
+                       [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY]):
+        raise OSError(f"could not write {out_path}")
+    return note, (width, height), tiles
+
+
 def run_job(conn, job):
     job_id = job["job_id"]
     files = [Path(p) for p in json.loads(job["bracket_files"])]
@@ -175,9 +289,10 @@ def run_job(conn, job):
         bracket = [frame_from_path(p) for p in files]
         output_path.parent.mkdir(parents=True, exist_ok=True)
         with memory:
-            # Keywords, not positions: fuse_bracket has do_perspective before these.
-            fuse_bracket(bracket, output_path, settings["half_size"], settings["align"],
-                         clahe_clip=settings["clahe_clip"], saturation=settings["saturation"])
+            # Jobs queued before tiling existed have no tile settings: fuse them whole, as queued.
+            _, _, tiles = fuse_bracket_tiled(bracket, output_path, settings["half_size"], settings["align"],
+                                             settings["clahe_clip"], settings["saturation"],
+                                             settings.get("tile_size", 0), settings.get("overlap", OVERLAP))
     except Exception as e:
         wall = time.perf_counter() - start
         peak = memory.peak_mb if hasattr(memory, "peak") else None
@@ -187,7 +302,8 @@ def run_job(conn, job):
 
     wall = time.perf_counter() - start
     set_status(conn, job_id, "complete", error=None, wall_seconds=wall, peak_memory_mb=memory.peak_mb)
-    print(f"[job {job_id}] complete -> {output_path.name} ({wall:.1f}s, peak {memory.peak_mb:.0f} MB)")
+    print(f"[job {job_id}] complete -> {output_path.name} "
+          f"({wall:.1f}s, peak {memory.peak_mb:.0f} MB, {tiles} tile(s))")
 
 
 def process_pending(conn):
@@ -198,6 +314,75 @@ def process_pending(conn):
         run_job(conn, job)
 
 
+def benchmark_child(files, out_path, settings, tile_size, results):
+    """Runs in a fresh process, so the RSS peak belongs to this one fusion alone."""
+    try:
+        bracket = [frame_from_path(Path(p)) for p in files]
+        baseline = psutil.Process().memory_info().rss / 2**20
+        start = time.perf_counter()
+        with PeakMemory() as memory:
+            _, (width, height), tiles = fuse_bracket_tiled(
+                bracket, out_path, settings["half_size"], settings["align"],
+                settings["clahe_clip"], settings["saturation"], tile_size, settings["overlap"])
+        results.put({"tiles": tiles, "width": width, "height": height, "baseline_memory_mb": baseline,
+                     "peak_memory_mb": memory.peak_mb, "wall_seconds": time.perf_counter() - start})
+    except Exception as e:
+        results.put({"error": str(e)})
+
+
+def compare_tiling(conn, input_dir, output_dir, settings):
+    """Fuse the folder's first bracket whole and tiled, and record peak memory for both."""
+    frames = find_frames(input_dir)
+    brackets, _ = group_brackets(frames) if frames else ([], [])
+    if not brackets:
+        print(f"no complete bracket in {input_dir}")
+        return
+    bracket = brackets[0]
+    if all(brightness(f) is not None for f in bracket):
+        bracket = sorted(bracket, key=brightness)
+    files = [str(f["path"].resolve()) for f in bracket]
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stem = bracket[0]["path"].stem
+    print(f"comparing memory on: {' '.join(Path(p).name for p in files)}")
+
+    context = multiprocessing.get_context("spawn")
+    outputs = {}
+    for mode, tile_size in (("whole", 0), ("tiled", settings["tile_size"])):
+        out_path = output_dir / f"{stem}_{mode}.jpg"
+        results = context.Queue()
+        child = context.Process(target=benchmark_child, args=(files, str(out_path), settings, tile_size, results))
+        child.start()
+        child.join()
+        try:
+            result = results.get(timeout=5)
+        except queue.Empty:
+            # Killed without reporting, e.g. the OS ended it for running out of memory.
+            result = {"error": f"process exited with code {child.exitcode} without a result"}
+        with conn:
+            conn.execute(
+                "INSERT INTO memory_benchmarks (bracket_files, mode, tile_size, overlap, tiles, width, height, "
+                "baseline_memory_mb, peak_memory_mb, wall_seconds, error, timestamp) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (json.dumps(files), mode, tile_size, settings["overlap"], result.get("tiles"), result.get("width"),
+                 result.get("height"), result.get("baseline_memory_mb"), result.get("peak_memory_mb"),
+                 result.get("wall_seconds"), result.get("error"), now()))
+        if "error" in result:
+            print(f"  {mode:<5} FAILED: {result['error']}")
+            continue
+        outputs[mode] = out_path
+        print(f"  {mode:<5} {result['width']}x{result['height']}, {result['tiles']} tile(s): "
+              f"peak {result['peak_memory_mb']:.0f} MB "
+              f"(fusion added {result['peak_memory_mb'] - result['baseline_memory_mb']:.0f} MB), "
+              f"{result['wall_seconds']:.1f}s -> {out_path.name}")
+
+    if len(outputs) == 2:
+        # Both are 8-bit JPEGs, so compression noise alone gives a difference of about 1.
+        whole, tiled = (cv2.imread(str(outputs[m])).astype(np.int16) for m in ("whole", "tiled"))
+        diff = np.abs(whole - tiled)
+        print(f"  whole vs tiled pixel difference: mean {diff.mean():.2f}, "
+              f"99th percentile {np.percentile(diff, 99):.0f}, max {diff.max()} (0-255)")
+
+
 def print_history(conn):
     print("jobs:")
     for r in conn.execute("SELECT job_id, status, wall_seconds, peak_memory_mb, error FROM jobs ORDER BY job_id"):
@@ -206,6 +391,15 @@ def print_history(conn):
     print("runs:")
     for r in conn.execute("SELECT timestamp, job_id, old_status, new_status FROM runs ORDER BY run_id"):
         print(f"  {r['timestamp']}  job {r['job_id']:>4}  {r['old_status'] or '(new)':<9} -> {r['new_status']}")
+    print("memory benchmarks:")
+    for r in conn.execute("SELECT * FROM memory_benchmarks ORDER BY bench_id"):
+        name = Path(json.loads(r["bracket_files"])[0]).name
+        if r["error"]:
+            print(f"  {r['timestamp']}  {name}  {r['mode']:<5} FAILED: {r['error']}")
+        else:
+            print(f"  {r['timestamp']}  {name}  {r['mode']:<5} {r['width']}x{r['height']}  "
+                  f"tile {r['tile_size']}/{r['overlap']}, {r['tiles']} tile(s)  "
+                  f"peak {r['peak_memory_mb']:.0f} MB  {r['wall_seconds']:.1f}s")
 
 
 def main():
@@ -217,8 +411,13 @@ def main():
     parser.add_argument("--no-align", action="store_true")
     parser.add_argument("--clahe-clip", type=float, default=CLAHE_CLIP)
     parser.add_argument("--saturation", type=float, default=SATURATION)
+    parser.add_argument("--tile-size", type=int, default=TILE_SIZE,
+                        help=f"tile edge in pixels, 0 to fuse whole (default {TILE_SIZE})")
+    parser.add_argument("--overlap", type=int, default=OVERLAP, help=f"tile overlap in pixels (default {OVERLAP})")
     parser.add_argument("--retry-failed", action="store_true", help="requeue failed jobs")
     parser.add_argument("--history", action="store_true", help="print jobs and status transitions, then exit")
+    parser.add_argument("--compare-tiling", action="store_true",
+                        help="fuse the first bracket in input_dir whole and tiled, record peak memory, then exit")
     args = parser.parse_args()
     if (args.input_dir is None) != (args.output_dir is None):
         parser.error("give both input_dir and output_dir, or neither")
@@ -226,18 +425,30 @@ def main():
         parser.error(f"{args.input_dir} is not a folder")
     if args.clahe_clip < 0 or args.saturation < 0:
         parser.error("--clahe-clip and --saturation must not be negative")
+    if args.overlap < 1:
+        parser.error("--overlap must be at least 1")
+    if args.tile_size != 0 and args.tile_size < 2 * args.overlap:
+        # Otherwise a tile's two feather ramps would overlap each other.
+        parser.error("--tile-size must be 0 or at least twice --overlap")
+    if args.compare_tiling and (args.input_dir is None or args.tile_size == 0):
+        parser.error("--compare-tiling needs input_dir, output_dir and a non-zero --tile-size")
 
     conn = connect(args.db)
     if args.history:
         print_history(conn)
         return
 
+    settings = {"half_size": args.half_size, "align": not args.no_align,
+                "clahe_clip": args.clahe_clip, "saturation": args.saturation,
+                "tile_size": args.tile_size, "overlap": args.overlap}
+    if args.compare_tiling:
+        compare_tiling(conn, args.input_dir, args.output_dir, settings)
+        return
+
     recover_interrupted(conn)
     if args.retry_failed:
         retry_failed(conn)
     if args.input_dir is not None:
-        settings = {"half_size": args.half_size, "align": not args.no_align,
-                    "clahe_clip": args.clahe_clip, "saturation": args.saturation}
         enqueue_folder(conn, args.input_dir, args.output_dir, settings)
     process_pending(conn)
 
