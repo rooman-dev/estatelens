@@ -173,9 +173,13 @@ def enhance(img, clahe_clip=CLAHE_CLIP, saturation=SATURATION):
     return img
 
 
-def fuse_bracket(bracket, out_path, half_size, do_align, do_perspective=True,
-                 clahe_clip=CLAHE_CLIP, saturation=SATURATION):
-    """Fuse one bracket and write a JPEG. Returns a note about the perspective step, or None."""
+def fuse_to_image(bracket, half_size, do_align, do_perspective=True):
+    """Decode, align, fuse and straighten one bracket, before any post-processing.
+
+    Returns (RGB uint8 image, note about the perspective step or None). The image is
+    what enhance_and_save() takes, so callers can keep it and re-apply contrast and
+    saturation without fusing again.
+    """
     images = [load_image(f["path"], half_size) for f in bracket]
     if len({img.shape for img in images}) != 1:
         raise ValueError("frames have different sizes")
@@ -191,10 +195,26 @@ def fuse_bracket(bracket, out_path, half_size, do_align, do_perspective=True,
         out, diag = correct_perspective_with_diagnostics(out)
         note = (f"perspective {diag['correction_deg']:.1f} deg"
                 if diag["applied"] else f"no perspective ({diag['reason']})")
-    out = enhance(out, clahe_clip, saturation)
+    return out, note
+
+
+def enhance_and_save(img, out_path, clahe_clip=CLAHE_CLIP, saturation=SATURATION):
+    """CLAHE and saturation on a fuse_to_image() result, then write the JPEG.
+
+    `img` is not modified. Returns the enhanced RGB image that was written.
+    """
+    out = enhance(img, clahe_clip, saturation)
     if not cv2.imwrite(str(out_path), cv2.cvtColor(out, cv2.COLOR_RGB2BGR),
                        [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY]):
         raise OSError(f"could not write {out_path}")
+    return out
+
+
+def fuse_bracket(bracket, out_path, half_size, do_align, do_perspective=True,
+                 clahe_clip=CLAHE_CLIP, saturation=SATURATION):
+    """Fuse one bracket and write a JPEG. Returns a note about the perspective step, or None."""
+    img, note = fuse_to_image(bracket, half_size, do_align, do_perspective)
+    enhance_and_save(img, out_path, clahe_clip, saturation)
     return note
 
 

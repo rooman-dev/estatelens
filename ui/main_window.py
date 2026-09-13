@@ -6,31 +6,53 @@ Threading rule: workers never touch widgets. They emit signals, and Qt delivers
 those to slots on the main (GUI) thread, which is the only place widgets change.
 Preview decoding runs on its own thread, separate from the scan/fuse worker, so
 clicking around the list never locks the toolbar or collides with a running job.
+
+Contrast and saturation are post-processing: they run on the fused result, not the
+brackets. The fuse_to_image() result is kept in memory for the last
+FUSED_CACHE_SIZE brackets, so moving a slider re-runs only enhance_and_save() on the
+cached image, on a third thread. A bracket is re-fused only when its cached image is gone
+or was fused with different upstream options (half size, align, straighten).
 """
 
 import sys
+import time
+from collections import OrderedDict
+from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
 import numpy as np
 import rawpy
-from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
+from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QColor, QImage, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QFileDialog, QHBoxLayout, QLabel, QListWidget,
-    QListWidgetItem, QMainWindow, QProgressBar, QPushButton, QSizePolicy, QSplitter,
-    QVBoxLayout, QWidget,
+    QListWidgetItem, QMainWindow, QProgressBar, QPushButton, QSizePolicy, QSlider,
+    QSplitter, QVBoxLayout, QWidget,
 )
 
 from core.prototype import (
-    JPEG_EXTS, TIFF_EXTS, brightness, describe_exposure, exposure_order, find_frames,
-    fuse_bracket, group_brackets,
+    CLAHE_CLIP, JPEG_EXTS, SATURATION, TIFF_EXTS, brightness, describe_exposure,
+    enhance_and_save, exposure_order, find_frames, fuse_to_image, group_brackets,
 )
 
 WARNING_COLOR = QColor("#b36b00")
 OK_COLOR = QColor("#2e7d32")
 FAIL_COLOR = QColor("#c62828")
 PREVIEW_LONG_EDGE = 1200
+FUSED_CACHE_SIZE = 4        # a 24MP fused RGB image is ~72 MB
+SLIDER_SCALE = 100          # QSlider holds ints; value 150 means 1.50
+CONTRAST_RANGE = (1.0, 3.0, 0.1)    # min, max, step
+SATURATION_RANGE = (1.0, 2.0, 0.05)
+SLIDER_SETTLE_MS = 300      # merges bursts of wheel/arrow-key steps into one run
+
+
+@dataclass(frozen=True)
+class FuseSettings:
+    """Upstream options. A cached fused image is only valid for the settings it was made with."""
+    half_size: bool
+    align: bool
+    straighten: bool
 
 
 # --- preview image loading ------------------------------------------------------
@@ -192,19 +214,27 @@ class ScanWorker(QObject):
 
 
 class FuseWorker(QObject):
-    """Fuses brackets one at a time, reporting progress through signals."""
+    """Fuses brackets one at a time, reporting progress through signals.
+
+    `indices` limits the run to those brackets (re-fusing one after a cache miss);
+    signals always carry the bracket's real index.
+    """
 
     bracket_started = Signal(int)
+    # index, fused RGB before post-processing, FuseSettings it was made with
+    fused_ready = Signal(int, object, object)
     # index, success, output name or error, middle-exposure path, output path
     bracket_done = Signal(int, bool, str, object, object)
     finished = Signal(int, int, bool)  # fused, failed, cancelled
 
-    def __init__(self, brackets, out_dir, half_size, do_align):
+    def __init__(self, brackets, out_dir, settings, clahe_clip, saturation, indices=None):
         super().__init__()
         self.brackets = brackets
         self.out_dir = out_dir
-        self.half_size = half_size
-        self.do_align = do_align
+        self.settings = settings
+        self.clahe_clip = clahe_clip
+        self.saturation = saturation
+        self.indices = list(range(len(brackets))) if indices is None else list(indices)
         self._cancelled = False
 
     def cancel(self):
@@ -218,12 +248,13 @@ class FuseWorker(QObject):
         try:
             self.out_dir.mkdir(parents=True, exist_ok=True)
         except OSError as e:
-            for i in range(len(self.brackets)):
+            for i in self.indices:
                 self.bracket_done.emit(i, False, str(e), None, None)
-            self.finished.emit(0, len(self.brackets), False)
+            self.finished.emit(0, len(self.indices), False)
             return
 
-        for i, bracket in enumerate(self.brackets):
+        for i in self.indices:
+            bracket = self.brackets[i]
             if self._cancelled:
                 break
             # Same ordering as prototype.main(): dark to bright when EXIF allows it.
@@ -235,7 +266,12 @@ class FuseWorker(QObject):
             out_path = self.out_dir / f"{bracket[0]['path'].stem}_fused.jpg"
             self.bracket_started.emit(i)
             try:
-                fuse_bracket(bracket, out_path, self.half_size, self.do_align)
+                image, _note = fuse_to_image(bracket, self.settings.half_size, self.settings.align,
+                                             self.settings.straighten)
+                # The array is handed over to the GUI thread's cache and never modified
+                # again here: enhance_and_save() leaves its input untouched.
+                self.fused_ready.emit(i, image, self.settings)
+                enhance_and_save(image, out_path, self.clahe_clip, self.saturation)
             except Exception as e:
                 failed += 1
                 self.bracket_done.emit(i, False, str(e), None, None)
@@ -243,6 +279,46 @@ class FuseWorker(QObject):
                 fused += 1
                 self.bracket_done.emit(i, True, out_path.name, middle_path, out_path)
         self.finished.emit(fused, failed, self._cancelled)
+
+
+class PostWorker(QObject):
+    """Re-runs only enhance_and_save() on a cached fused image, then builds the After preview."""
+
+    done = Signal(int, object, float, str)  # index, after QImage, seconds taken, error ("" if none)
+    finished = Signal()
+
+    def __init__(self, index, image, clahe_clip, saturation, out_path):
+        super().__init__()
+        self.index = index
+        self.image = image
+        self.clahe_clip = clahe_clip
+        self.saturation = saturation
+        self.out_path = out_path
+
+    @Slot()
+    def run(self):
+        start = time.perf_counter()
+        try:
+            out = enhance_and_save(self.image, self.out_path, self.clahe_clip, self.saturation)
+            # Build the preview from the array we already have instead of re-reading the JPEG.
+            after = to_qimage(downscale(out))
+            self.done.emit(self.index, after, time.perf_counter() - start, "")
+        except Exception as e:
+            self.done.emit(self.index, None, 0.0, str(e))
+        finally:
+            self.finished.emit()
+
+
+def make_slider(value_range, value):
+    """Horizontal QSlider over `value_range` (min, max, step), in SLIDER_SCALE units."""
+    minimum, maximum, step = (round(v * SLIDER_SCALE) for v in value_range)
+    slider = QSlider(Qt.Horizontal)
+    slider.setRange(minimum, maximum)
+    slider.setSingleStep(step)
+    slider.setPageStep(step * 5)
+    slider.setValue(round(value * SLIDER_SCALE))
+    slider.setFixedWidth(140)
+    return slider
 
 
 class MainWindow(QMainWindow):
@@ -267,7 +343,17 @@ class MainWindow(QMainWindow):
         self._preview_worker = None
         self._preview_wanted = None  # index the user is currently asking to see
         self._preview_pending = None # queued while a decode is in flight
-        self._results_half_size = False  # the option the current outputs were fused with
+        self._results_half_size = {}     # bracket index -> half-size option its output was fused with
+
+        # Fused images before post-processing, most recently used last.
+        self._fused_cache = OrderedDict()  # bracket index -> (FuseSettings, RGB uint8)
+        self._post_thread = None
+        self._post_worker = None
+        self._post_pending = None    # bracket to post-process again once the running pass ends
+        self._post_timer = QTimer(self)
+        self._post_timer.setSingleShot(True)
+        self._post_timer.setInterval(SLIDER_SETTLE_MS)
+        self._post_timer.timeout.connect(self.reprocess_selected)
 
         self.input_label = QLabel("No folder chosen")
         self.output_label = QLabel("-")
@@ -281,6 +367,15 @@ class MainWindow(QMainWindow):
         self.half_size = QCheckBox("Half size (faster, less memory)")
         self.align = QCheckBox("Align frames")
         self.align.setChecked(True)
+        self.straighten = QCheckBox("Straighten verticals")
+        self.straighten.setChecked(True)
+        self.contrast = make_slider(CONTRAST_RANGE, CLAHE_CLIP)
+        self.saturation = make_slider(SATURATION_RANGE, SATURATION)
+        self.contrast_value = QLabel()
+        self.saturation_value = QLabel()
+        for label in (self.contrast_value, self.saturation_value):
+            label.setMinimumWidth(32)
+        self.update_slider_labels()
         self.process_button = QPushButton("Process")
         self.process_button.setEnabled(False)
         self.progress = QProgressBar()
@@ -328,6 +423,13 @@ class MainWindow(QMainWindow):
         options = QHBoxLayout()
         options.addWidget(self.half_size)
         options.addWidget(self.align)
+        options.addWidget(self.straighten)
+        options.addSpacing(16)
+        for text, slider, value in (("Contrast", self.contrast, self.contrast_value),
+                                    ("Saturation", self.saturation, self.saturation_value)):
+            options.addWidget(QLabel(text))
+            options.addWidget(slider)
+            options.addWidget(value)
         options.addStretch(1)
         options.addWidget(self.process_button)
         rows.addLayout(options)
@@ -341,6 +443,10 @@ class MainWindow(QMainWindow):
         self.output_button.clicked.connect(self.choose_output)
         self.process_button.clicked.connect(self.process_or_cancel)
         self.list.currentItemChanged.connect(self.on_list_selection)
+        for slider, value_range in ((self.contrast, CONTRAST_RANGE), (self.saturation, SATURATION_RANGE)):
+            slider.valueChanged.connect(
+                lambda value, s=slider, step=round(value_range[2] * SLIDER_SCALE): self.on_slider_changed(s, value, step))
+            slider.sliderReleased.connect(self._post_timer.start)
 
     # --- folder selection and scanning ---------------------------------------
 
@@ -407,16 +513,31 @@ class MainWindow(QMainWindow):
             item.setText(item.text().split("  —")[0])
             item.setForeground(self.list.palette().text().color())
         self.clear_previews()  # these outputs are about to be overwritten
-        self._results_half_size = self.half_size.isChecked()
         self.progress.setMaximum(len(self.brackets))
         self.progress.setValue(0)
-        self.start_worker(FuseWorker(self.brackets, self.output_dir,
-                                     self.half_size.isChecked(), self.align.isChecked()))
+        self.start_worker(FuseWorker(self.brackets, self.output_dir, self.fuse_settings(),
+                                     *self.post_settings()))
+
+    def fuse_settings(self):
+        return FuseSettings(self.half_size.isChecked(), self.align.isChecked(), self.straighten.isChecked())
+
+    def post_settings(self):
+        """(clahe_clip, saturation) from the sliders."""
+        return self.contrast.value() / SLIDER_SCALE, self.saturation.value() / SLIDER_SCALE
 
     @Slot(int)
     def on_bracket_started(self, i):
         self.status.setText(f"Fusing bracket {i + 1} of {len(self.brackets)}…")
-        self.bracket_items[i].setText(f"{self.bracket_items[i].text()}  — working…")
+        item = self.bracket_items[i]
+        item.setText(f"{item.text().split('  —')[0]}  — working…")
+
+    @Slot(int, object, object)
+    def on_fused_ready(self, i, image, settings):
+        self._fused_cache[i] = (settings, image)
+        self._fused_cache.move_to_end(i)
+        while len(self._fused_cache) > FUSED_CACHE_SIZE:
+            self._fused_cache.popitem(last=False)
+        self._results_half_size[i] = settings.half_size
 
     @Slot(int, bool, str, object, object)
     def on_bracket_done(self, i, ok, message, before_path, after_path):
@@ -425,9 +546,101 @@ class MainWindow(QMainWindow):
         item.setText(f"{base}  — ✓ {message}" if ok else f"{base}  — ✗ failed: {message}")
         item.setForeground(OK_COLOR if ok else FAIL_COLOR)
         self.progress.setValue(self.progress.value() + 1)
+        self._preview_cache.pop(i, None)  # the file on disk was just rewritten
         if ok:
             self.results[i] = (before_path, after_path)
             self.show_preview(i)
+        else:
+            self._fused_cache.pop(i, None)
+
+    # --- contrast / saturation -----------------------------------------------------
+
+    def update_slider_labels(self):
+        clahe_clip, saturation = self.post_settings()
+        self.contrast_value.setText(f"{clahe_clip:.1f}")
+        self.saturation_value.setText(f"{saturation:.2f}")
+
+    def on_slider_changed(self, slider, value, step):
+        # A mouse drag lands on any integer; snap to the step. setValue re-enters this
+        # method with the snapped value, which then does the real work.
+        snapped = round(value / step) * step
+        if snapped != value:
+            slider.setValue(snapped)
+            return
+        self.update_slider_labels()  # cheap, so live while dragging
+        # While dragging, wait for sliderReleased. Keyboard, wheel and track clicks
+        # never press the handle, so they only arrive here; the timer merges bursts.
+        if not slider.isSliderDown():
+            self._post_timer.start()
+
+    def selected_index(self):
+        item = self.list.currentItem()
+        return None if item is None else item.data(Qt.UserRole)
+
+    @Slot()
+    def reprocess_selected(self):
+        index = self.selected_index()
+        if index is None or index not in self.results:
+            self.status.setText("Contrast and saturation will apply to the next Process.")
+            return
+        self.reprocess(index)
+
+    def reprocess(self, index):
+        """Apply the sliders to bracket `index`: post-process only if its cached image is still valid."""
+        if self._busy:
+            return  # a fuse is running; it already reads the sliders for brackets it hasn't written
+        if self._post_thread is not None:
+            # Don't start a second writer on the same JPEG; run once more with the latest values.
+            self._post_pending = index
+            return
+        cached = self._fused_cache.get(index)
+        if cached is None or cached[0] != self.fuse_settings():
+            reason = "not in memory" if cached is None else "options changed since it was fused"
+            self.status.setText(f"Re-fusing bracket {index + 1} ({reason})…")
+            self.progress.setMaximum(1)
+            self.progress.setValue(0)
+            self.start_worker(FuseWorker(self.brackets, self.output_dir, self.fuse_settings(),
+                                         *self.post_settings(), indices=[index]))
+            return
+        self._fused_cache.move_to_end(index)
+        clahe_clip, saturation = self.post_settings()
+        worker = PostWorker(index, cached[1], clahe_clip, saturation, self.results[index][1])
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.done.connect(self.on_post_done)
+        worker.finished.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self.on_post_thread_finished)
+        self._post_thread, self._post_worker = thread, worker
+        self.process_button.setEnabled(False)
+        self.status.setText(f"Applying contrast {clahe_clip:.1f}, saturation {saturation:.2f} "
+                            f"to bracket {index + 1}…")
+        thread.start()
+
+    @Slot(int, object, float, str)
+    def on_post_done(self, index, after, seconds, error):
+        if error:
+            self.status.setText(f"Contrast/saturation failed on bracket {index + 1}: {error}")
+            return
+        if index in self._preview_cache:
+            before, _old_after, sizes = self._preview_cache[index]
+            self._preview_cache[index] = (before, after, sizes)  # same pixels size, so sizes still hold
+        if index == self._preview_wanted:
+            self.show_preview(index)
+        self.status.setText(f"Bracket {index + 1}: contrast and saturation applied in {seconds:.2f} s.")
+
+    @Slot()
+    def on_post_thread_finished(self):
+        self._post_thread = self._post_worker = None
+        self.set_busy(self._busy)
+        if self._close_pending:
+            self.close()
+            return
+        pending, self._post_pending = self._post_pending, None
+        if pending is not None:
+            self.reprocess(pending)
 
     # --- before/after preview --------------------------------------------------
 
@@ -493,13 +706,15 @@ class MainWindow(QMainWindow):
         self.before_caption.setText(f"Before — {before_path.name} (middle exposure)")
         self.after_caption.setText(f"After — {after_path.name}")
         # Real file dimensions, not the scaled-to-fit preview the panes are showing.
-        self.preview_status.setText(describe_sizes(index, *sizes, self._results_half_size))
+        self.preview_status.setText(describe_sizes(index, *sizes, self._results_half_size.get(index, False)))
 
     def clear_previews(self):
         self.results = {}
         self._preview_cache = {}
+        self._fused_cache = OrderedDict()
         self._preview_wanted = self._preview_pending = None
-        self._results_half_size = False
+        self._post_pending = None
+        self._results_half_size = {}
         self.before_pane.clear_image()
         self.after_pane.clear_image()
         self.before_caption.setText("Before")
@@ -536,6 +751,7 @@ class MainWindow(QMainWindow):
             worker.finished.connect(self.on_scan_finished)
         else:
             worker.bracket_started.connect(self.on_bracket_started)
+            worker.fused_ready.connect(self.on_fused_ready)
             worker.bracket_done.connect(self.on_bracket_done)
             worker.finished.connect(self.on_fuse_finished)
         worker.finished.connect(self.on_worker_finished)
@@ -561,10 +777,22 @@ class MainWindow(QMainWindow):
         self.output_button.setEnabled(not busy and self.input_dir is not None)
         self.half_size.setEnabled(not busy)
         self.align.setEnabled(not busy)
+        self.straighten.setEnabled(not busy)
+        self.contrast.setEnabled(not busy)
+        self.saturation.setEnabled(not busy)
         self.process_button.setText("Cancel" if processing else "Process")
-        self.process_button.setEnabled(processing or (not busy and bool(self.brackets)))
+        # A running post-processing pass is writing a JPEG that Process would overwrite.
+        self.process_button.setEnabled(
+            processing or (not busy and bool(self.brackets) and self._post_thread is None))
 
     def closeEvent(self, event):
+        self._post_timer.stop()
+        self._post_pending = None
+        if self._post_thread is not None:
+            # Let the JPEG finish writing rather than leave a truncated file; closes when done.
+            self._close_pending = True
+            event.ignore()
+            return
         if self._busy:
             # Closing now would destroy a running QThread and crash. Cancel, and
             # close automatically once the current bracket finishes.
