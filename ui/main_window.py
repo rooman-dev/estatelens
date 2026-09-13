@@ -12,6 +12,12 @@ brackets. The fuse_to_image() result is kept in memory for the last
 FUSED_CACHE_SIZE brackets, so moving a slider re-runs only enhance_and_save() on the
 cached image, on a third thread. A bracket is re-fused only when its cached image is gone
 or was fused with different upstream options (half size, align, straighten).
+
+EchoLearn: each fused bracket is classified by SceneSense on the worker thread.
+Selecting a classified bracket sets the sliders to echolearn.get_defaults(scene),
+without re-running post-processing; releasing a slider logs the value against
+the global default. Brackets that aren't classified (not fused yet, or
+classification failed) leave the sliders alone and log nothing.
 """
 
 import sys
@@ -31,10 +37,12 @@ from PySide6.QtWidgets import (
     QSplitter, QVBoxLayout, QWidget,
 )
 
+from core import echolearn
 from core.prototype import (
     CLAHE_CLIP, JPEG_EXTS, SATURATION, TIFF_EXTS, brightness, describe_exposure,
     enhance_and_save, exposure_order, find_frames, fuse_to_image, group_brackets,
 )
+from processing.scenesense import classify_scene
 
 WARNING_COLOR = QColor("#b36b00")
 OK_COLOR = QColor("#2e7d32")
@@ -225,6 +233,7 @@ class FuseWorker(QObject):
     fused_ready = Signal(int, object, object)
     # index, success, output name or error, middle-exposure path, output path
     bracket_done = Signal(int, bool, str, object, object)
+    scene_ready = Signal(int, str)     # index, SceneSense label
     finished = Signal(int, int, bool)  # fused, failed, cancelled
 
     def __init__(self, brackets, out_dir, settings, clahe_clip, saturation, indices=None):
@@ -276,6 +285,12 @@ class FuseWorker(QObject):
                 failed += 1
                 self.bracket_done.emit(i, False, str(e), None, None)
             else:
+                try:
+                    # SceneSense expects BGR; fuse_to_image returns RGB.
+                    label, _conf = classify_scene(cv2.cvtColor(image, cv2.COLOR_RGB2BGR), source=out_path.name)
+                    self.scene_ready.emit(i, label)
+                except Exception:
+                    pass  # unclassified: EchoLearn just skips this bracket
                 fused += 1
                 self.bracket_done.emit(i, True, out_path.name, middle_path, out_path)
         self.finished.emit(fused, failed, self._cancelled)
@@ -344,6 +359,7 @@ class MainWindow(QMainWindow):
         self._preview_wanted = None  # index the user is currently asking to see
         self._preview_pending = None # queued while a decode is in flight
         self._results_half_size = {}     # bracket index -> half-size option its output was fused with
+        self._scene_types = {}           # bracket index -> SceneSense label
 
         # Fused images before post-processing, most recently used last.
         self._fused_cache = OrderedDict()  # bracket index -> (FuseSettings, RGB uint8)
@@ -447,6 +463,7 @@ class MainWindow(QMainWindow):
             slider.valueChanged.connect(
                 lambda value, s=slider, step=round(value_range[2] * SLIDER_SCALE): self.on_slider_changed(s, value, step))
             slider.sliderReleased.connect(self._post_timer.start)
+            slider.sliderReleased.connect(lambda s=slider: self.on_slider_released(s))
 
     # --- folder selection and scanning ---------------------------------------
 
@@ -573,6 +590,43 @@ class MainWindow(QMainWindow):
         if not slider.isSliderDown():
             self._post_timer.start()
 
+    # --- EchoLearn ------------------------------------------------------------------
+
+    def learned_sliders(self):
+        """(slider, value range, echolearn param name) for each learnable slider."""
+        return ((self.contrast, CONTRAST_RANGE, "clahe_clip"),
+                (self.saturation, SATURATION_RANGE, "saturation"))
+
+    @Slot(int, str)
+    def on_scene_ready(self, index, label):
+        self._scene_types[index] = label
+
+    def on_slider_released(self, slider):
+        index = self.selected_index()
+        scene = self._scene_types.get(index)
+        if scene is None:
+            return
+        for s, _range, param in self.learned_sliders():
+            if s is slider:
+                # Measured from the global default, the same base get_defaults adds to.
+                echolearn.log_adjustment(scene, param, echolearn.GLOBAL_DEFAULTS[param],
+                                         slider.value() / SLIDER_SCALE)
+
+    def apply_learned_defaults(self, index):
+        """Set the sliders to EchoLearn's defaults for bracket `index`'s scene, clamped and snapped."""
+        scene = self._scene_types.get(index)
+        if scene is None:
+            return
+        defaults = echolearn.get_defaults(scene)
+        for slider, (low, high, step), param in self.learned_sliders():
+            value = min(max(defaults[param], low), high)
+            value = low + round((value - low) / step) * step
+            # Blocked so selecting a bracket doesn't rewrite its JPEG or trigger a re-fuse.
+            slider.blockSignals(True)
+            slider.setValue(round(value * SLIDER_SCALE))
+            slider.blockSignals(False)
+        self.update_slider_labels()
+
     def selected_index(self):
         item = self.list.currentItem()
         return None if item is None else item.data(Qt.UserRole)
@@ -651,6 +705,7 @@ class MainWindow(QMainWindow):
             return
         index = item.data(Qt.UserRole)
         if index is not None:
+            self.apply_learned_defaults(index)
             self.show_preview(index)
 
     def show_preview(self, index):
@@ -715,6 +770,7 @@ class MainWindow(QMainWindow):
         self._preview_wanted = self._preview_pending = None
         self._post_pending = None
         self._results_half_size = {}
+        self._scene_types = {}
         self.before_pane.clear_image()
         self.after_pane.clear_image()
         self.before_caption.setText("Before")
@@ -753,6 +809,7 @@ class MainWindow(QMainWindow):
             worker.bracket_started.connect(self.on_bracket_started)
             worker.fused_ready.connect(self.on_fused_ready)
             worker.bracket_done.connect(self.on_bracket_done)
+            worker.scene_ready.connect(self.on_scene_ready)
             worker.finished.connect(self.on_fuse_finished)
         worker.finished.connect(self.on_worker_finished)
 
