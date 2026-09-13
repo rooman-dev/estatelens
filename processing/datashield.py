@@ -40,8 +40,12 @@ DEFAULT_QUALITY = 85
 MIN_QUALITY = 40
 
 # Embedded previews and maker notes can add megabytes to a web JPEG.
+# "MakerNotes" (not "MakerNotes:all") matches the maker note block itself, which
+# ExifTool copies as one binary tag (e.g. ExifIFD:MakerNoteCanon).
 EXIF_EXCLUDE = ["ICC_Profile:all", "PreviewImage", "ThumbnailImage", "JpgFromRaw",
-                "OtherImage", "MakerNotes:all"]
+                "OtherImage", "MakerNotes"]
+# GPS is removed with deletions ("-TAG=") after the copy, not "--TAG" exclusions:
+# with ExifTool 13.59, "--GPS:all" still let the EXIF GPS block through.
 GPS_TAGS = ["GPS:all", "XMP-exif:GPS*", "XMP:Location*"]
 
 
@@ -200,18 +204,36 @@ def copy_metadata(source_path, jpeg_path, width, height, keep_gps=False):
         log.warning("source %s not found; exporting without metadata", source_path)
         return False
 
-    exclude = EXIF_EXCLUDE + ([] if keep_gps else GPS_TAGS)
     cmd = [exiftool, "-m", "-q", "-q", "-overwrite_original",
            "-TagsFromFile", str(source_path), "-all:all",
-           *(f"--{tag}" for tag in exclude),
+           *(f"--{tag}" for tag in EXIF_EXCLUDE),
+           *([] if keep_gps else (f"-{tag}=" for tag in GPS_TAGS)),
            "-Orientation#=1", "-ColorSpace#=1",
            f"-ExifImageWidth={width}", f"-ExifImageHeight={height}",
            str(jpeg_path)]
     run = subprocess.run(cmd, capture_output=True, text=True)
     if run.returncode != 0:
         log.warning("ExifTool failed (%s); exporting without metadata", run.stderr.strip())
+        _strip_all(exiftool, jpeg_path)
+        return False
+
+    # Fail safe: a location leak is worse than losing metadata.
+    if not keep_gps and _gps_tags(exiftool, jpeg_path):
+        log.warning("GPS still present after stripping; removing all metadata")
+        _strip_all(exiftool, jpeg_path)
         return False
     return True
+
+
+def _gps_tags(exiftool, path):
+    run = subprocess.run([exiftool, "-q", "-q", "-a", "-s", "-G1", "-GPS:all", "-XMP:GPS*",
+                          "-XMP:Location*", str(path)], capture_output=True, text=True)
+    return run.stdout.strip().splitlines()
+
+
+def _strip_all(exiftool, path):
+    subprocess.run([exiftool, "-q", "-q", "-m", "-overwrite_original", "-all=", str(path)],
+                   capture_output=True)
 
 
 # -------------------------------------------------------------------- export
