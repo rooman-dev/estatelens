@@ -7,10 +7,18 @@
 as Mertens fusion produces). Colour, edge and brightness statistics are measured
 on a copy shrunk to ANALYSIS_LONG_EDGE.
 
-is_exterior uses only exterior cues (sky in the top third, vegetation at the
-bottom, bright smooth top) and never depends on room typing. Ambiguous scores
-return (False, AMBIGUOUS_CONFIDENCE): a missed sky replacement is cheaper than a
-sky pasted onto a ceiling. A confidence >= 0.5 means a clear decision.
+is_exterior never depends on room typing. It weighs two kinds of positive evidence:
+  exterior: a sky found by structure, not hue. That means a large smooth region
+            spanning down from the top edge, with few fine edges, a smooth
+            brightness gradient, and brighter than what lies below it. Colour and
+            vegetation are weak support.
+  interior: a smooth top region darker than what's below (a ceiling), and
+            rectilinear lines.
+A confident answer needs one side strong and clearly ahead. "No evidence either
+way" (e.g. a sky-less canyon) gives (False, AMBIGUOUS_CONFIDENCE): unsure,
+failing safe, since a missed sky replacement is cheaper than a sky pasted onto a
+ceiling. A confidence >= 0.5 means a clear decision. Logged label: exterior /
+interior / unsure.
 
 classify_scene calls the same exterior scorer first, and types rooms only for
 confident interiors. When scores are weak or too close, it returns
@@ -55,15 +63,27 @@ WARM_H = (5, 25)
 NEUTRAL_MAX_S = 30
 NEUTRAL_MIN_V = 60
 WHITE_MIN_V = 200
-SKY_BLUE_MIN_V = 90
-SKY_BRIGHT_MIN_V = 215   # overcast sky: near-white and bright
 
 LINE_MIN_LENGTH_FRACTION = 0.06   # of the long edge
 AXIS_TOLERANCE_DEG = 10           # meaningful once perspective is corrected
 
-# Exterior decision
-EXTERIOR_TRUE_MIN = 0.60    # score >= this -> exterior
-EXTERIOR_FALSE_MAX = 0.40   # score <= this -> interior; in between is ambiguous
+# Sky candidate: structure, not hue
+SKY_BLUR_SIGMA = 1.5
+SKY_MAX_GRADIENT = 5.0            # per-pixel luminance change (0-255 scale) after blur
+SKY_CLOSE_FRACTION = 0.01         # closing kernel on the seed mask, fraction of long edge (5 px at 512). Pinholes
+                                  # only: at >= 0.03 closing merged ground/wall patches and flooded every image
+# Region growing from the seeds: cloud variation is absorbed, a brightness discontinuity stops growth.
+SKY_STEP_TOL = 4                  # max brightness step between neighbouring pixels (0-255, blurred). At 6 growth
+                                  # leaked through hazy ridges and down rock walls (waterfall -> confident interior)
+SKY_RANGE_TOL = 0.10              # grown pixels must stay within the seed's [p5, p95] luminance +/- this,
+                                  # so growth can't chain down a slow gradient into a wall
+SKY_MIN_COMPONENT_FRAC = 0.01     # of image area
+SKY_FINE_CANNY = (30, 90)         # on the unblurred image, to see texture the blur hid
+
+# Exterior decision: two-sided evidence
+EXTERIOR_MIN_EVIDENCE = 0.55      # E >= this to call exterior
+INTERIOR_MIN_EVIDENCE = 0.50      # I >= this to call interior
+DECISION_MIN_MARGIN = 0.20        # winner must beat the other side by this much
 AMBIGUOUS_CONFIDENCE = 0.2
 
 # Room typing
@@ -107,11 +127,16 @@ class SceneFeatures:
     warm_frac: float
     neutral_frac: float
     white_frac: float
-    sky_top_frac: float         # blue or bright-neutral pixels in the top third
     green_bottom_frac: float    # green pixels in the bottom half
+    # top smooth region (sky or ceiling candidate); see _top_smooth_region
+    sky_area_frac: float        # region area / image area
+    sky_top_coverage: float     # share of columns where the region starts at the top edge
+    sky_edge_density: float     # fine-scale edges inside the region
+    sky_residual: float         # luminance std around a fitted quadratic surface (0-1 scale)
+    sky_below_ratio: float      # region mean luminance / mean luminance directly below it
+    sky_colour_support: float   # share of region pixels with a plausible sky colour (blue, neutral, sunset)
     # edges
     edge_density: float
-    top_edge_density: float
     line_length_norm: float     # total Hough line length / (width + height)
     axis_line_frac: float       # share of line length within AXIS_TOLERANCE_DEG of horizontal/vertical
     fine_texture: float         # mean |Laplacian| / 255
@@ -152,6 +177,99 @@ def _in_band(hue, band):
     return (hue >= band[0]) & (hue <= band[1])
 
 
+def _grow_region(blurred, seed):
+    """Grow `seed` into neighbours whose brightness steps by at most SKY_STEP_TOL.
+
+    floodFill in floating-range mode compares each pixel with the neighbour it was
+    reached from, so soft cloud variation is absorbed and a sharp step (roofline,
+    horizon) stops growth. Pixels outside the seed's luminance range +/- SKY_RANGE_TOL
+    are pre-blocked in the mask to stop slow chaining across gradients.
+    """
+    h, w = blurred.shape
+    if not seed.any():
+        return seed
+    lo, hi = np.percentile(blurred[seed], [5, 95])
+    tol = SKY_RANGE_TOL * 255.0
+    blocked = (blurred < lo - tol) | (blurred > hi + tol)
+    # floodFill mask is 2 px larger; non-zero cells are never filled. Filled cells become 2.
+    mask = np.ones((h + 2, w + 2), np.uint8)
+    mask[1:-1, 1:-1] = blocked
+    flags = 4 | cv2.FLOODFILL_MASK_ONLY | (2 << 8)
+    image = blurred.copy()   # floodFill wants a writable image even in mask-only mode
+    for x in np.flatnonzero(seed[0]):
+        if mask[1, x + 1] == 0:
+            cv2.floodFill(image, mask, (int(x), 0), 0, SKY_STEP_TOL, SKY_STEP_TOL, flags)
+    return (mask[1:-1, 1:-1] == 2) | seed
+
+
+def _top_smooth_region(gray):
+    """Per-column span of sky candidate running down from the top edge.
+
+    Seeds: low-gradient connected components that touch the top edge and are large
+    enough. They are then grown by brightness similarity (_grow_region). Each
+    column's span stops at the first non-region pixel. Returns (span mask, bottom
+    row per column, -1 where the column has no span).
+    """
+    h, w = gray.shape
+    blurred = cv2.GaussianBlur(gray, (0, 0), SKY_BLUR_SIGMA)
+    gx = cv2.Sobel(blurred, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(blurred, cv2.CV_32F, 0, 1, ksize=3)
+    smooth = (np.hypot(gx, gy) / 8.0 < SKY_MAX_GRADIENT).astype(np.uint8)   # Sobel 3x3 gain is 8
+    size = max(3, int(round(SKY_CLOSE_FRACTION * max(h, w))) | 1)   # odd
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
+    smooth = cv2.morphologyEx(smooth, cv2.MORPH_CLOSE, kernel)
+
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(smooth, connectivity=4)
+    min_area = SKY_MIN_COMPONENT_FRAC * h * w
+    keep = [lab for lab in np.unique(labels[0]) if lab != 0 and stats[lab, cv2.CC_STAT_AREA] >= min_area]
+    seed = np.isin(labels, keep) if keep else np.zeros((h, w), bool)
+    region = _grow_region(blurred, seed)
+
+    # First non-region row in each column; h if the whole column is region.
+    first_gap = np.where(region.all(axis=0), h, np.argmin(region, axis=0))
+    bottom = np.where(region[0], first_gap - 1, -1)
+    span = np.arange(h)[:, None] <= bottom[None, :]
+    return span, bottom
+
+
+def _sky_features(gray, lum, hue, sat, val):
+    h, w = gray.shape
+    span, bottom = _top_smooth_region(gray)
+    area = int(span.sum())
+    if area == 0:
+        return dict(sky_area_frac=0.0, sky_top_coverage=0.0, sky_edge_density=0.0,
+                    sky_residual=0.0, sky_below_ratio=1.0, sky_colour_support=0.0)
+
+    fine_edges = cv2.Canny(gray, *SKY_FINE_CANNY) > 0
+
+    # Smooth brightness: residual around a quadratic surface fitted to the region.
+    ys, xs = np.nonzero(span)
+    if len(ys) > 20000:
+        pick = np.random.default_rng(0).choice(len(ys), 20000, replace=False)
+        ys, xs = ys[pick], xs[pick]
+    x, y = xs / w, ys / h
+    design = np.column_stack([np.ones_like(x), x, y, x * x, y * y, x * y])
+    target = lum[ys, xs]
+    coef, *_ = np.linalg.lstsq(design, target, rcond=None)
+    residual = float(np.std(target - design @ coef))
+
+    # Brighter than below: compare with the same columns' pixels under the span.
+    below = (np.arange(h)[:, None] > bottom[None, :]) & (bottom[None, :] >= 0)
+    below_mean = lum[below].mean() if below.any() else lum[span].mean()
+    below_ratio = float(lum[span].mean() / (below_mean + 1e-3))
+
+    # Colour, weak support only: blue, neutral, or sunset warm/pink/purple. Green or other saturated hues are not sky.
+    plausible = (_in_band(hue, BLUE_H) | (sat < NEUTRAL_MAX_S) | (hue <= WARM_H[1]) | (hue >= 140)) & (val >= 40)
+    return dict(
+        sky_area_frac=area / (h * w),
+        sky_top_coverage=float((bottom >= 0).mean()),
+        sky_edge_density=float(fine_edges[span].mean()),
+        sky_residual=residual,
+        sky_below_ratio=below_ratio,
+        sky_colour_support=float(plausible[span].mean()),
+    )
+
+
 def extract_features(image):
     img = _prepare(image)
     h, w = img.shape[:2]
@@ -171,7 +289,6 @@ def extract_features(image):
     warm = coloured & _in_band(hue, WARM_H)
     neutral = (sat < NEUTRAL_MAX_S) & (val >= NEUTRAL_MIN_V)
     white = neutral & (val >= WHITE_MIN_V)
-    sky = (blue & (val >= SKY_BLUE_MIN_V)) | (neutral & (val >= SKY_BRIGHT_MIN_V))
 
     # Canny thresholds follow the median, with floors so dark or flat images don't turn noise into edges.
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
@@ -184,7 +301,7 @@ def extract_features(image):
                             minLineLength=max(5, int(LINE_MIN_LENGTH_FRACTION * long_edge)), maxLineGap=5)
     total_len = axis_len = 0.0
     if lines is not None:
-        x1, y1, x2, y2 = lines[:, 0, :].astype(np.float64).T
+        x1, y1, x2, y2 = lines.reshape(-1, 4).astype(np.float64).T  # (N,1,4) or (N,4) depending on OpenCV build
         lengths = np.hypot(x2 - x1, y2 - y1)
         angles = np.degrees(np.arctan2(y2 - y1, x2 - x1)) % 180.0
         off_axis = np.minimum.reduce([angles, 180.0 - angles, np.abs(angles - 90.0)])
@@ -209,10 +326,9 @@ def extract_features(image):
         warm_frac=float(warm.mean()),
         neutral_frac=float(neutral.mean()),
         white_frac=float(white.mean()),
-        sky_top_frac=float(sky[top].mean()),
         green_bottom_frac=float(green[bottom_half].mean()),
+        **_sky_features(gray, lum, hue, sat, val),
         edge_density=float(edge_mask.mean()),
-        top_edge_density=float(edge_mask[top].mean()),
         line_length_norm=total_len / (w + h),
         axis_line_frac=axis_len / total_len if total_len > 0 else 0.0,
         fine_texture=float(np.abs(laplacian).mean() / 255.0),
@@ -221,24 +337,43 @@ def extract_features(image):
 
 # ---------------------------------------------------------------- scoring
 
+def _top_region_presence(f):
+    """How clearly a large smooth region spans the top of the frame, in [0, 1]. Says nothing about sky vs ceiling."""
+    return _ramp(f.sky_area_frac, 0.05, 0.25) * _ramp(f.sky_top_coverage, 0.30, 0.80)
+
+
 def exterior_score(f):
-    """Evidence for an exterior shot in [0, 1]. Uses exterior cues only."""
-    # Sky counts only if the top is also smooth: a bright ceiling full of fixtures or a window frame is not sky.
-    smooth_top = 1.0 - _ramp(f.top_edge_density, 0.02, 0.10)
-    return (0.40 * _ramp(f.sky_top_frac, 0.10, 0.50) * (0.5 + 0.5 * smooth_top)
-            + 0.20 * _ramp(f.green_bottom_frac, 0.05, 0.30)
-            + 0.15 * _ramp(f.top_bottom_ratio, 1.0, 1.6)
-            + 0.15 * smooth_top
-            + 0.10 * _ramp(f.blue_frac + f.green_frac, 0.05, 0.30))
+    """Positive evidence for exterior in [0, 1]. Sky structure dominates; colour and vegetation only support."""
+    presence = _top_region_presence(f)
+    # Brighter-than-below is required, not just weighted: without it a flat grey frame scored as sky.
+    brighter = _ramp(f.sky_below_ratio, 1.0, 1.15)
+    quality = (0.55 * (1.0 - _ramp(f.sky_edge_density, 0.01, 0.06))
+               + 0.45 * (1.0 - _ramp(f.sky_residual, 0.04, 0.15)))
+    structure = brighter * (0.4 + 0.6 * quality)
+    return (0.80 * presence * structure
+            + 0.10 * presence * f.sky_colour_support
+            + 0.10 * _ramp(f.green_bottom_frac, 0.05, 0.30))
 
 
-def exterior_decision(score):
-    """score -> (is_exterior, confidence). Ambiguous scores fail safe to False."""
-    if score >= EXTERIOR_TRUE_MIN:
-        return True, 0.5 + 0.5 * _ramp(score, EXTERIOR_TRUE_MIN, 0.90)
-    if score <= EXTERIOR_FALSE_MAX:
-        return False, 0.5 + 0.5 * (1.0 - _ramp(score, 0.10, EXTERIOR_FALSE_MAX))
-    return False, AMBIGUOUS_CONFIDENCE
+def interior_score(f):
+    """Positive evidence for interior in [0, 1]. The absence of sky is NOT evidence here."""
+    # Ceiling: a smooth top region that is darker than, or level with, what's below it. Skies are brighter.
+    ceiling = _top_region_presence(f) * (1.0 - _ramp(f.sky_below_ratio, 0.85, 1.05))
+    rectilinear = _ramp(f.axis_line_frac, 0.60, 0.90) * _ramp(f.line_length_norm, 1.0, 3.0)
+    return 0.70 * ceiling + 0.30 * rectilinear
+
+
+def exterior_decision(ext, inte):
+    """(exterior evidence, interior evidence) -> (is_exterior, confidence, ambiguous).
+
+    A confident answer needs strong evidence for one side that clearly beats the other.
+    Weak or conflicting evidence gives (False, AMBIGUOUS_CONFIDENCE): unsure, failing safe.
+    """
+    if ext >= EXTERIOR_MIN_EVIDENCE and ext - inte >= DECISION_MIN_MARGIN:
+        return True, 0.5 + 0.5 * _ramp(ext - inte, DECISION_MIN_MARGIN, 0.70), False
+    if inte >= INTERIOR_MIN_EVIDENCE and inte - ext >= DECISION_MIN_MARGIN:
+        return False, 0.5 + 0.5 * _ramp(inte - ext, DECISION_MIN_MARGIN, 0.70), False
+    return False, AMBIGUOUS_CONFIDENCE, True
 
 
 def room_scores(f):
@@ -261,12 +396,12 @@ def room_scores(f):
 
 def classify_features(f):
     """SceneFeatures -> (label, confidence, scores). No I/O, so logged rows can be re-scored."""
-    ext = exterior_score(f)
-    is_ext, ext_conf = exterior_decision(ext)
-    scores = {"exterior": ext}
+    ext, inte = exterior_score(f), interior_score(f)
+    is_ext, ext_conf, ambiguous = exterior_decision(ext, inte)
+    scores = {"exterior": ext, "interior": inte}
     if is_ext:
         return "exterior", ext_conf, scores
-    if ext_conf <= AMBIGUOUS_CONFIDENCE:
+    if ambiguous:
         return "other", OTHER_CONFIDENCE, scores   # not sure it is even an interior
 
     rooms = room_scores(f)
@@ -288,9 +423,10 @@ def classify_features(f):
 
 def _thresholds():
     names = ["ANALYSIS_LONG_EDGE", "COLOURED_MIN_S", "COLOURED_MIN_V", "BLUE_H", "GREEN_H", "WARM_H",
-             "NEUTRAL_MAX_S", "NEUTRAL_MIN_V", "WHITE_MIN_V", "SKY_BLUE_MIN_V", "SKY_BRIGHT_MIN_V",
-             "LINE_MIN_LENGTH_FRACTION", "AXIS_TOLERANCE_DEG", "EXTERIOR_TRUE_MIN", "EXTERIOR_FALSE_MAX",
-             "AMBIGUOUS_CONFIDENCE", "ROOM_MIN_SCORE", "ROOM_MIN_MARGIN", "ROOM_SOFTMAX_TEMPERATURE",
+             "NEUTRAL_MAX_S", "NEUTRAL_MIN_V", "WHITE_MIN_V",
+             "LINE_MIN_LENGTH_FRACTION", "AXIS_TOLERANCE_DEG", "SKY_BLUR_SIGMA", "SKY_MAX_GRADIENT",
+             "SKY_CLOSE_FRACTION", "SKY_STEP_TOL", "SKY_RANGE_TOL", "SKY_MIN_COMPONENT_FRAC", "SKY_FINE_CANNY", "EXTERIOR_MIN_EVIDENCE",
+             "INTERIOR_MIN_EVIDENCE", "DECISION_MIN_MARGIN", "AMBIGUOUS_CONFIDENCE", "ROOM_MIN_SCORE", "ROOM_MIN_MARGIN", "ROOM_SOFTMAX_TEMPERATURE",
              "OTHER_CONFIDENCE"]
     return {n: globals()[n] for n in names}
 
@@ -321,10 +457,10 @@ def _log_row(db_path, call, label, confidence, features, scores, source):
 def is_exterior(image, source=None, db_path=DEFAULT_DB):
     """-> (is_exterior, confidence). Independent of room typing."""
     f = extract_features(image)
-    score = exterior_score(f)
-    result, conf = exterior_decision(score)
-    _log_row(db_path, "is_exterior", "exterior" if result else "interior", conf, f,
-             {"exterior": score}, source)
+    ext, inte = exterior_score(f), interior_score(f)
+    result, conf, ambiguous = exterior_decision(ext, inte)
+    label = "exterior" if result else ("unsure" if ambiguous else "interior")
+    _log_row(db_path, "is_exterior", label, conf, f, {"exterior": ext, "interior": inte}, source)
     return result, conf
 
 
