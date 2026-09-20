@@ -20,6 +20,18 @@ Usage:
 --prepare works on a partial download: missing camera zips are skipped with a
 warning. With --subset the split is made over the intended cameras, so it does
 not change as more zips arrive.
+
+Night filter: SkyFinder file names carry the capture time (YYYYMMDD_HHMMSS in
+local time), so night is decided by the clock, not by brightness. Frames outside
+--day-hours are dropped from train and val. Test keeps every frame: some cameras
+have a bright hazy night sky under light pollution (camera 9708 is the clear
+case), which is a real condition a sky model has to face, so it belongs in the
+evaluation rather than being filtered out of it. Every CSV row carries `hour`
+and `night`, so eval can report day and night separately.
+
+The older brightness filter (--night-threshold) is off by default. It judged
+mean brightness inside the sky region, which misses exactly the light-polluted
+cameras: 9708's night frames average 122 there, well above any usable threshold.
 """
 
 import argparse
@@ -27,6 +39,7 @@ import csv
 import hashlib
 import json
 import random
+import re
 import sys
 import urllib.request
 import zipfile
@@ -42,6 +55,10 @@ METADATA_CSV = "complete_table_with_mcr.csv"
 SUBSET_JSON = "subset.json"
 SIZE = 512
 IMAGE_EXTS = {".jpg", ".jpeg", ".png"}
+# AMOS file names: <camera>/YYYYMMDD_HHMMSS.jpg, local time at the camera.
+TIMESTAMP_RE = re.compile(r"(\d{8})_(\d{2})(\d{2})(\d{2})")
+DAY_HOURS = (7, 18)          # kept when DAY_HOURS[0] <= hour < DAY_HOURS[1]
+FILTERED_SPLITS = ("train", "val")
 
 
 # ---------------------------------------------------------------- download
@@ -232,8 +249,21 @@ def split_cameras(camera_ids, seed, val_frac, test_frac):
     return splits
 
 
+def frame_hour(name):
+    """Local hour of capture from an AMOS file name, or None if it has no timestamp."""
+    m = TIMESTAMP_RE.search(Path(name).stem)
+    return int(m.group(2)) if m else None
+
+
+def is_night(hour, day_hours):
+    """True when `hour` falls outside the daylight window. Unknown hour is never night."""
+    if hour is None or not day_hours:
+        return False
+    return not (day_hours[0] <= hour < day_hours[1])
+
+
 def prepare(raw_dir, out_dir, cameras=None, seed=0, val_frac=0.15, test_frac=0.15,
-            night_threshold=40.0, max_per_camera=0):
+            night_threshold=0.0, max_per_camera=0, day_hours=DAY_HOURS):
     """Build the processed dataset.
 
     `cameras` is the intended camera list (e.g. the subset). The split is made
@@ -260,6 +290,8 @@ def prepare(raw_dir, out_dir, cameras=None, seed=0, val_frac=0.15, test_frac=0.1
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "splits.json").write_text(json.dumps(
         {"seed": seed, "size": SIZE, "night_threshold": night_threshold,
+         "day_hours": list(day_hours) if day_hours else None,
+         "night_filtered_splits": list(FILTERED_SPLITS),
          "max_per_camera": max_per_camera, "missing": missing, **splits}, indent=2))
 
     for split, cams in splits.items():
@@ -267,21 +299,27 @@ def prepare(raw_dir, out_dir, cameras=None, seed=0, val_frac=0.15, test_frac=0.1
         mask_dir = out_dir / split / "masks"
         img_dir.mkdir(parents=True, exist_ok=True)
         mask_dir.mkdir(parents=True, exist_ok=True)
+        # Test keeps night frames: a lit, hazy night sky is a condition the model
+        # must be measured on, not one the dataset hides.
+        split_day_hours = day_hours if split in FILTERED_SPLITS else None
         rows = []
         for cam in cams:
             if cam not in zips:
                 continue
             rows += _prepare_camera(cam, zips[cam], masks[cam], img_dir, mask_dir,
-                                    night_threshold, max_per_camera, seed)
+                                    night_threshold, max_per_camera, seed, split_day_hours)
         with open(out_dir / f"{split}.csv", "w", newline="") as f:
             w = csv.writer(f)
-            w.writerow(["camera", "image", "mask"])
+            w.writerow(["camera", "image", "mask", "hour", "night"])
             w.writerows(rows)
-        print(f"{split}: {len(cams)} cameras, {len(rows)} images")
+        n_night = sum(1 for r in rows if r[4] == 1)
+        kept_night = "night kept" if split_day_hours is None else "night dropped"
+        print(f"{split}: {len(cams)} cameras, {len(rows)} images "
+              f"({n_night} night, {kept_night})")
 
 
 def _prepare_camera(cam, zip_path, mask, img_dir, mask_dir,
-                    night_threshold, max_per_camera, seed):
+                    night_threshold, max_per_camera, seed, day_hours):
     h, w = mask.shape
     if mask.all() or not mask.any():
         print(f"warning: camera {cam} mask is all one class")
@@ -291,7 +329,7 @@ def _prepare_camera(cam, zip_path, mask, img_dir, mask_dir,
     mask_name = f"{cam}.png"
     cv2.imwrite(str(mask_dir / mask_name), mask_small)
 
-    kept = dropped_bad = dropped_night = 0
+    kept = dropped_bad = dropped_night = dropped_dark = no_timestamp = kept_night = 0
     rows = []
     try:
         z = zipfile.ZipFile(zip_path)
@@ -303,6 +341,13 @@ def _prepare_camera(cam, zip_path, mask, img_dir, mask_dir,
         if max_per_camera and len(names) > max_per_camera:
             names = sorted(random.Random(f"{seed}-{cam}").sample(names, max_per_camera))
         for name in names:
+            hour = frame_hour(name)
+            if hour is None:
+                no_timestamp += 1
+            night = is_night(hour, day_hours) if day_hours else is_night(hour, DAY_HOURS)
+            if day_hours and night:
+                dropped_night += 1
+                continue
             img = cv2.imdecode(np.frombuffer(z.read(name), np.uint8), cv2.IMREAD_COLOR)
             if img is None or img.shape[:2] != (h, w):
                 dropped_bad += 1
@@ -312,17 +357,23 @@ def _prepare_camera(cam, zip_path, mask, img_dir, mask_dir,
             if night_threshold > 0:
                 gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
                 if gray[mask].mean() < night_threshold:
-                    dropped_night += 1
+                    dropped_dark += 1
                     continue
             # Squash to 512x512 (aspect ratio not preserved). INTER_AREA is the
             # right filter for downscaling.
             small = cv2.resize(img, (SIZE, SIZE), interpolation=cv2.INTER_AREA)
             out_name = f"{cam}_{Path(name).stem}.jpg"
             cv2.imwrite(str(img_dir / out_name), small, [cv2.IMWRITE_JPEG_QUALITY, 95])
-            rows.append([cam, out_name, mask_name])
+            rows.append([cam, out_name, mask_name, "" if hour is None else hour, int(night)])
             kept += 1
-    print(f"  camera {cam}: kept {kept}, unreadable/wrong size {dropped_bad}, "
-          f"night {dropped_night}")
+            kept_night += night
+    extra = f", no timestamp {no_timestamp}" if no_timestamp else ""
+    if day_hours:
+        print(f"  camera {cam}: kept {kept}, unreadable/wrong size {dropped_bad}, "
+              f"night dropped {dropped_night}, too dark {dropped_dark}{extra}")
+    else:
+        print(f"  camera {cam}: kept {kept} ({kept_night} night, kept on purpose), "
+              f"unreadable/wrong size {dropped_bad}, too dark {dropped_dark}{extra}")
     return rows
 
 
@@ -396,8 +447,12 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--val-frac", type=float, default=0.15)
     ap.add_argument("--test-frac", type=float, default=0.15)
-    ap.add_argument("--night-threshold", type=float, default=40.0,
-                    help="drop images whose mean sky brightness (0-255) is below this; 0 disables")
+    ap.add_argument("--night-threshold", type=float, default=0.0,
+                    help="also drop images whose mean sky brightness (0-255) is below this; "
+                         "0 disables. Off by default: the clock filter replaced it")
+    ap.add_argument("--day-hours", type=int, nargs=2, metavar=("START", "END"), default=list(DAY_HOURS),
+                    help=f"keep frames captured at START <= hour < END (local time from the file "
+                         f"name); applies to {'/'.join(FILTERED_SPLITS)} only. Pass 0 0 to disable")
     ap.add_argument("--max-per-camera", type=int, default=0,
                     help="randomly keep at most N images per camera; 0 keeps all")
     args = ap.parse_args()
@@ -419,8 +474,9 @@ def main():
     if args.download:
         download(raw, set(cameras) if cameras else None)
     if args.prepare:
+        day_hours = tuple(args.day_hours) if args.day_hours[1] > args.day_hours[0] else None
         prepare(raw, processed, cameras, args.seed, args.val_frac, args.test_frac,
-                args.night_threshold, args.max_per_camera)
+                args.night_threshold, args.max_per_camera, day_hours)
 
 
 if __name__ == "__main__":
