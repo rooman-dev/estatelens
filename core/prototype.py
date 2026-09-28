@@ -21,13 +21,17 @@ import rawpy
 
 from core.truevertical import correct_perspective_with_diagnostics
 
-RAW_EXTS = {".cr2", ".nef", ".arw", ".dng"}
+RAW_EXTS = {".cr2", ".nef", ".arw", ".dng", ".orf", ".srw"}
 TIFF_EXTS = {".tif", ".tiff"}  # synthetic test brackets; rawpy cannot read these
 JPEG_EXTS = {".jpg", ".jpeg"}  # already-developed frames; read with OpenCV, not rawpy
 BRACKET_SIZE = 3
 # Frames this close together belong to one bracket. Commercial HDR systems allow
 # up to 90s; 3s used to split tripod brackets shot at a slower pace.
 GAP_SECONDS = 30.0
+# Once a bracket has at least three frames, a shorter pause starts a new one.
+# This separates back-to-back five-shot sequences without splitting a long
+# exposure that is still completing a three-shot bracket.
+BETWEEN_BRACKETS_GAP_SECONDS = 10.0
 JPEG_QUALITY = 95
 CLAHE_CLIP = 1.5
 CLAHE_TILES = (8, 8)
@@ -83,8 +87,14 @@ def exposure_order(frame):
 
 def find_frames(folder):
     frames = []
-    for path in sorted(folder.iterdir()):
+    paths = sorted(path for path in folder.iterdir() if path.is_file())
+    raw_stems = {path.stem.casefold() for path in paths if path.suffix.lower() in RAW_EXTS}
+    for path in paths:
         if path.suffix.lower() in RAW_EXTS | TIFF_EXTS | JPEG_EXTS:
+            # Cameras often save a JPEG alongside each RAW. Treating both as
+            # exposures duplicates frames and changes the bracket boundaries.
+            if path.suffix.lower() in JPEG_EXTS and path.stem.casefold() in raw_stems:
+                continue
             timestamp, exposure, f_number, iso = read_exif(path)
             frames.append({"path": path, "timestamp": timestamp,
                            "exposure": exposure, "f_number": f_number, "iso": iso})
@@ -102,8 +112,10 @@ def chunk(cluster, warnings):
 
 
 def group_brackets(frames):
-    """Group by capture time; fall back to filename order if any timestamp is missing."""
+    """Group by capture time; keep complete three-or-more-exposure sets."""
     warnings = []
+    if not frames:
+        return [], warnings
     if any(f["timestamp"] is None for f in frames):
         warnings.append("some files have no EXIF timestamp; grouping by filename order")
         return chunk(sorted(frames, key=lambda f: f["path"].name), warnings), warnings
@@ -113,14 +125,21 @@ def group_brackets(frames):
     for prev, cur in zip(frames, frames[1:]):
         # Timestamps mark the start of an exposure, so measure from the end of the previous one.
         prev_end = prev["timestamp"].timestamp() + (prev["exposure"] or 0)
-        if cur["timestamp"].timestamp() - prev_end <= GAP_SECONDS:
+        gap = cur["timestamp"].timestamp() - prev_end
+        if gap <= GAP_SECONDS and not (
+            len(clusters[-1]) >= BRACKET_SIZE and gap > BETWEEN_BRACKETS_GAP_SECONDS
+        ):
             clusters[-1].append(cur)
         else:
             clusters.append([cur])
 
     brackets = []
     for cluster in clusters:
-        brackets.extend(chunk(cluster, warnings))
+        if len(cluster) >= BRACKET_SIZE:
+            brackets.append(cluster)
+        else:
+            names = ", ".join(f["path"].name for f in cluster)
+            warnings.append(f"incomplete bracket skipped ({len(cluster)} of at least {BRACKET_SIZE}): {names}")
     return brackets, warnings
 
 

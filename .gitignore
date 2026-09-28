@@ -17,6 +17,8 @@ data/
 *.[nN][eE][fF]
 *.[aA][rR][wW]
 *.[dD][nN][gG]
+*.[oO][rR][fF]
+*.[sS][rR][wW]
 
 # Exceptions: UI assets and report figures are committed
 !ui/assets/**
