@@ -163,7 +163,9 @@ def train(args):
             target = target.to(device, non_blocking=True)
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
                 loss = segmentation_loss(model(image), target)
-            scaler.scale(loss / args.accumulate).backward()
+            window_start = ((step - 1) // args.accumulate) * args.accumulate
+            window_size = min(args.accumulate, steps_this_epoch - window_start)
+            scaler.scale(loss / window_size).backward()
             if step % args.accumulate == 0 or step == steps_this_epoch:
                 scaler.step(optimizer)
                 scaler.update()
