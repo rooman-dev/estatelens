@@ -382,7 +382,7 @@ def _prepare_camera(cam, zip_path, mask, img_dir, mask_dir,
 try:
     import torch
     from torch.utils.data import Dataset
-except ImportError:  # data prep itself does not need torch
+except (ImportError, OSError):  # data prep itself does not need torch
     torch = None
     Dataset = object
 
