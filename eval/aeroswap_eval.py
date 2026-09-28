@@ -35,14 +35,20 @@ depend on a model class.
 """
 
 import argparse
+import csv
 import json
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import cv2
 import numpy as np
-import torch
-from torch.utils.data import DataLoader
+try:
+    import torch
+    from torch.utils.data import DataLoader
+except (ImportError, OSError):  # the brightness baseline can run without PyTorch
+    torch = None
+    DataLoader = None
 
 from models.aeroswap_data import SkyFinderDataset
 
@@ -61,7 +67,10 @@ class Counts:
     images: int = 0
 
     def add(self, pred, true):
-        p, t = pred.bool(), true.bool()
+        if isinstance(pred, np.ndarray):
+            p, t = pred.astype(bool, copy=False), true.astype(bool, copy=False)
+        else:
+            p, t = pred.bool(), true.bool()
         self.inter_sky += int((p & t).sum())
         self.union_sky += int((p | t).sum())
         self.inter_bg += int((~p & ~t).sum())
@@ -92,6 +101,8 @@ class Report:
 def evaluate(predict, root=DEFAULT_ROOT, split="test", threshold=THRESHOLD,
              batch_size=BATCH_SIZE, device="cpu"):
     """Score `predict` on one prepared split. Returns a Report."""
+    if torch is None:
+        raise RuntimeError("model evaluation requires a working PyTorch installation")
     root = Path(root)
     dataset = SkyFinderDataset(root, split)
     if not len(dataset):
@@ -125,6 +136,10 @@ def evaluate(predict, root=DEFAULT_ROOT, split="test", threshold=THRESHOLD,
             per_condition[cond].add(p, t)
         seen += pred.shape[0]
 
+    return _make_report(split, pooled, per_camera, per_camera_condition, per_condition)
+
+
+def _make_report(split, pooled, per_camera, per_camera_condition, per_condition):
     report = Report(split=split, pooled=pooled.metrics())
     for cam, counts in sorted(per_camera.items(), key=lambda kv: int(kv[0])):
         entry = counts.metrics()
@@ -139,6 +154,43 @@ def evaluate(predict, root=DEFAULT_ROOT, split="test", threshold=THRESHOLD,
     return report
 
 
+def evaluate_brightness_numpy(root=DEFAULT_ROOT, split="test", brightness=0.55,
+                              threshold=THRESHOLD):
+    """Score the original brightness baseline using OpenCV when torch cannot load."""
+    root = Path(root)
+    with (root / f"{split}.csv").open(newline="") as f:
+        rows = list(csv.DictReader(f))
+    if not rows:
+        raise SystemExit(f"{split} split is empty: run models.aeroswap_data --prepare first")
+    pooled = Counts()
+    per_camera = defaultdict(Counts)
+    per_camera_condition = defaultdict(Counts)
+    per_condition = defaultdict(Counts)
+    masks = {}
+    for row in rows:
+        image_path = root / split / "images" / row["image"]
+        image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+        if image is None:
+            raise OSError(f"unreadable image: {image_path}")
+        mask_path = root / split / "masks" / row["mask"]
+        if row["mask"] not in masks:
+            mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+            if mask is None:
+                raise OSError(f"unreadable mask: {mask_path}")
+            masks[row["mask"]] = mask > 127
+        true = masks[row["mask"]][None, None]
+        pred = ((image.astype(np.float32) / 255).mean(axis=2)[None, None] > brightness) > threshold
+        if pred.shape != true.shape:
+            raise ValueError(f"image and mask sizes differ: {image_path}")
+        cam = row["camera"]
+        cond = "night" if str(row.get("night", "0")) == "1" else "day"
+        pooled.add(pred, true)
+        per_camera[cam].add(pred, true)
+        per_camera_condition[(cam, cond)].add(pred, true)
+        per_condition[cond].add(pred, true)
+    return _make_report(split, pooled, per_camera, per_camera_condition, per_condition)
+
+
 def brightness_baseline(threshold=0.55):
     """Trivial 'bright pixels are sky' predictor. Not a model: a floor to compare against."""
     def predict(images):
@@ -147,6 +199,8 @@ def brightness_baseline(threshold=0.55):
 
 
 def load_checkpoint(path, device="cpu"):
+    if torch is None:
+        raise RuntimeError("checkpoint evaluation requires a working PyTorch installation")
     model = torch.jit.load(str(path), map_location=device)
     model.eval()
     return model
@@ -179,14 +233,17 @@ def main():
                     help="score the brightness baseline instead of a model")
     ap.add_argument("--threshold", type=float, default=THRESHOLD)
     ap.add_argument("--batch-size", type=int, default=BATCH_SIZE)
-    ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--device", default="cuda" if torch is not None and torch.cuda.is_available() else "cpu")
     ap.add_argument("--out", type=Path, help="write the report as JSON")
     args = ap.parse_args()
     if bool(args.checkpoint) == bool(args.baseline):
         ap.error("pass either --checkpoint or --baseline")
 
-    predict = brightness_baseline() if args.baseline else load_checkpoint(args.checkpoint, args.device)
-    report = evaluate(predict, args.root, args.split, args.threshold, args.batch_size, args.device)
+    if args.baseline and torch is None:
+        report = evaluate_brightness_numpy(args.root, args.split, threshold=args.threshold)
+    else:
+        predict = brightness_baseline() if args.baseline else load_checkpoint(args.checkpoint, args.device)
+        report = evaluate(predict, args.root, args.split, args.threshold, args.batch_size, args.device)
     print_report(report)
     if args.out:
         args.out.parent.mkdir(parents=True, exist_ok=True)
