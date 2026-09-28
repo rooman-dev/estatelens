@@ -13,5 +13,11 @@ python -m models.aeroswap_data --reference --download --prepare
 The reference settings keep frames captured from 07:00 to 17:59 in training
 and validation, while retaining day and night frames in testing. The prepared
 images and camera archives live under `data/skyfinder/` and are ignored by Git.
-The handover reports a 0.5377 brightness baseline on this split; that score
-needs to be reproduced from the prepared files before comparing a trained model.
+The brightness baseline was reproduced on all 4,880 test images from the three
+test cameras. Pooled mIoU was **0.537748** (0.5377 to four decimals), matching
+the handover. Camera 9708 scored 0.397863 and camera 10870 scored 0.626280.
+The full per-camera and day/night report is in `baseline.json`.
+
+The test-only preparation used the three test camera archives and the committed
+reference settings. It did not need train or validation camera archives. The
+training and validation data must still be prepared before model training.
