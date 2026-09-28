@@ -15,6 +15,7 @@ Pipeline:
 Usage:
     python -m models.aeroswap_data --select 15
     python -m models.aeroswap_data --subset --download --prepare
+    python -m models.aeroswap_data --reference --download --prepare
     python -m models.aeroswap_data --download --cameras 858 3888 --prepare
 
 --prepare works on a partial download: missing camera zips are skipped with a
@@ -53,6 +54,7 @@ METADATA_URL = "https://cs.valdosta.edu/~rpmihail/skyfinder/analysis/complete_ta
 MASKS_ZIP = "skyfinder_masks.zip"
 METADATA_CSV = "complete_table_with_mcr.csv"
 SUBSET_JSON = "subset.json"
+REFERENCE_DIR = Path(__file__).resolve().parents[1] / "eval" / "skyfinder_reference"
 SIZE = 512
 IMAGE_EXTS = {".jpg", ".jpeg", ".png"}
 # AMOS file names: <camera>/YYYYMMDD_HHMMSS.jpg, local time at the camera.
@@ -263,7 +265,8 @@ def is_night(hour, day_hours):
 
 
 def prepare(raw_dir, out_dir, cameras=None, seed=0, val_frac=0.15, test_frac=0.15,
-            night_threshold=0.0, max_per_camera=0, day_hours=DAY_HOURS):
+            night_threshold=0.0, max_per_camera=0, day_hours=DAY_HOURS,
+            reference_splits=None):
     """Build the processed dataset.
 
     `cameras` is the intended camera list (e.g. the subset). The split is made
@@ -286,7 +289,13 @@ def prepare(raw_dir, out_dir, cameras=None, seed=0, val_frac=0.15, test_frac=0.1
         print(f"warning: {len(missing)}/{len(cameras)} camera zips not downloaded yet: "
               f"{' '.join(missing)}")
 
-    splits = split_cameras(cameras, seed, val_frac, test_frac)
+    if reference_splits is None:
+        splits = split_cameras(cameras, seed, val_frac, test_frac)
+    else:
+        splits = {name: list(reference_splits[name]) for name in ("train", "val", "test")}
+        assigned = [cam for group in splits.values() for cam in group]
+        if len(assigned) != len(set(assigned)) or set(assigned) != set(cameras):
+            raise ValueError("reference splits must assign every camera exactly once")
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "splits.json").write_text(json.dumps(
         {"seed": seed, "size": SIZE, "night_threshold": night_threshold,
@@ -443,6 +452,8 @@ def main():
     ap.add_argument("--prepare", action="store_true")
     ap.add_argument("--subset", action="store_true",
                     help="use the cameras in subset.json for --download and --prepare")
+    ap.add_argument("--reference", action="store_true",
+                    help="use the committed FYP camera subset, split, and preparation settings")
     ap.add_argument("--cameras", nargs="+", help="use these camera IDs for --download and --prepare")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--val-frac", type=float, default=0.15)
@@ -458,14 +469,24 @@ def main():
     args = ap.parse_args()
     if not (args.select or args.download or args.prepare):
         ap.error("pass --select, --download and/or --prepare")
-    if args.subset and args.cameras:
-        ap.error("--subset and --cameras are mutually exclusive")
+    if sum((bool(args.subset), bool(args.reference), bool(args.cameras))) > 1:
+        ap.error("--subset, --reference, and --cameras are mutually exclusive")
+    if args.select and args.reference:
+        ap.error("--select and --reference are mutually exclusive")
 
     raw, processed = args.root / "raw", args.root / "processed"
     if args.select:
         select(args.root, args.select)
 
     cameras = args.cameras
+    reference_splits = None
+    if args.reference:
+        cameras = json.loads((REFERENCE_DIR / "subset.json").read_text())["cameras"]
+        reference_splits = json.loads((REFERENCE_DIR / "splits.json").read_text())
+        args.seed = reference_splits["seed"]
+        args.night_threshold = reference_splits["night_threshold"]
+        args.max_per_camera = reference_splits["max_per_camera"]
+        args.day_hours = reference_splits["day_hours"]
     if args.subset:
         subset_path = args.root / SUBSET_JSON
         if not subset_path.exists():
@@ -476,7 +497,7 @@ def main():
     if args.prepare:
         day_hours = tuple(args.day_hours) if args.day_hours[1] > args.day_hours[0] else None
         prepare(raw, processed, cameras, args.seed, args.val_frac, args.test_frac,
-                args.night_threshold, args.max_per_camera, day_hours)
+                args.night_threshold, args.max_per_camera, day_hours, reference_splits)
 
 
 if __name__ == "__main__":
