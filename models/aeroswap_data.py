@@ -84,12 +84,31 @@ def list_remote_files():
     return files
 
 
-def _fetch(url, dest):
-    """Download url to dest via a .part file, so a crash never leaves a truncated file."""
+def _fetch(url, dest, size):
+    """Download through a .part file, resuming only a verified HTTP byte range."""
     part = dest.with_name(dest.name + ".part")
-    with urllib.request.urlopen(url, timeout=60) as r, open(part, "wb") as f:
-        while block := r.read(1 << 20):
-            f.write(block)
+    offset = part.stat().st_size if part.exists() else 0
+    if offset > size:
+        offset = 0
+    if offset == size:
+        part.replace(dest)
+        return
+    request = urllib.request.Request(url, headers={"Range": f"bytes={offset}-"}) if offset else url
+    with urllib.request.urlopen(request, timeout=60) as r:
+        if offset and r.status == 206:
+            content_range = r.headers.get("Content-Range", "")
+            if not content_range.startswith(f"bytes {offset}-"):
+                raise OSError(f"unexpected resumed range: {content_range}")
+            mode = "ab"
+        elif r.status == 200:
+            mode = "wb"
+        else:
+            raise OSError(f"unexpected HTTP status {r.status} for {url}")
+        with open(part, mode) as f:
+            while block := r.read(1 << 20):
+                f.write(block)
+    if part.stat().st_size != size:
+        raise OSError(f"download size mismatch for {dest.name}: {part.stat().st_size} != {size}")
     part.replace(dest)
 
 
@@ -203,13 +222,13 @@ def download(raw_dir, cameras=None):
             sys.exit(f"cameras not in SkyFinder: {sorted(missing)}")
 
     for i, name in enumerate(wanted, 1):
-        url, md5, _ = remote[name]
+        url, md5, size = remote[name]
         dest = raw_dir / name
         if dest.exists() and _md5(dest) == md5:
             print(f"[{i}/{len(wanted)}] {name}: ok, skipping", flush=True)
             continue
         print(f"[{i}/{len(wanted)}] {name}: downloading", flush=True)
-        _fetch(url, dest)
+        _fetch(url, dest, size)
         got = _md5(dest)
         if got != md5:
             dest.unlink()
