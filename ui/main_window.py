@@ -24,6 +24,7 @@ review the replacement, and save a separate sky version. Neither preview nor
 save modifies the original fused JPEG.
 """
 
+import os
 import sys
 import time
 from collections import OrderedDict
@@ -59,6 +60,7 @@ SLIDER_SCALE = 100          # QSlider holds ints; value 150 means 1.50
 CONTRAST_RANGE = (1.0, 3.0, 0.1)    # min, max, step
 SATURATION_RANGE = (1.0, 2.0, 0.05)
 SLIDER_SETTLE_MS = 300      # merges bursts of wheel/arrow-key steps into one run
+EXPERIMENTAL_SKY_ENABLED = os.environ.get("ESTATELENS_EXPERIMENTAL_SKY") == "1"
 
 
 @dataclass(frozen=True)
@@ -527,13 +529,14 @@ class MainWindow(QMainWindow):
         preview_rows = QVBoxLayout()
         preview_rows.addLayout(panes, 1)
         preview_rows.addWidget(self.preview_status)
-        preview_controls = QHBoxLayout()
-        preview_controls.addStretch(1)
-        preview_controls.addWidget(self.sky_button)
-        preview_controls.addWidget(self.choose_sky_button)
-        preview_controls.addWidget(self.save_sky_button)
-        preview_controls.addWidget(self.photo_button)
-        preview_rows.addLayout(preview_controls)
+        if EXPERIMENTAL_SKY_ENABLED:
+            preview_controls = QHBoxLayout()
+            preview_controls.addStretch(1)
+            preview_controls.addWidget(self.sky_button)
+            preview_controls.addWidget(self.choose_sky_button)
+            preview_controls.addWidget(self.save_sky_button)
+            preview_controls.addWidget(self.photo_button)
+            preview_rows.addLayout(preview_controls)
         preview_panel = QWidget()
         preview_panel.setLayout(preview_rows)
 
