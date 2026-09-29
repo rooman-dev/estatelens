@@ -33,6 +33,8 @@ class SkyReplaceTests(unittest.TestCase):
             probability = np.full((512, 512), 255, dtype=np.uint8)
             with self.assertRaises(ValueError):
                 save_sky_version(fused_path, sky_path, probability, fused_path)
+            with self.assertRaises(ValueError):
+                save_sky_version(fused_path, sky_path, probability, sky_path)
             save_sky_version(fused_path, sky_path, probability, output_path)
             self.assertEqual(fused_path.read_bytes(), before)
             self.assertTrue(output_path.exists())

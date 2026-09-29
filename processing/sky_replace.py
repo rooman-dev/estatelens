@@ -70,8 +70,8 @@ def read_rgb(path):
 def save_sky_version(fused_path, sky_path, probability, output_path):
     """Write a separate image atomically, refusing the fused photo's path."""
     fused_path, sky_path, output_path = map(Path, (fused_path, sky_path, output_path))
-    if output_path.resolve() == fused_path.resolve():
-        raise ValueError("sky version cannot overwrite the original fused photo")
+    if output_path.resolve() in (fused_path.resolve(), sky_path.resolve()):
+        raise ValueError("sky version cannot overwrite either input photo")
     if output_path.suffix.lower() not in (".jpg", ".jpeg", ".png"):
         raise ValueError("sky version must be a JPEG or PNG")
     fused = read_rgb(fused_path)
