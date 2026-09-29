@@ -1,4 +1,4 @@
-"""Sky segmentation scoring: mIoU per camera, per condition, and pooled.
+"""Sky segmentation scoring: mIoU and sky Boundary IoU by camera/condition.
 
     evaluate(predict, root, split) -> Report
 
@@ -26,6 +26,11 @@ IoU is accumulated as intersection and union pixel counts, then divided once at
 the end. That is the standard dataset-level IoU: averaging per-image IoUs would
 let frames with almost no sky swing the result. mIoU is the mean of the sky and
 non-sky IoUs, so predicting all-sky or all-background cannot score well.
+
+Sky Boundary IoU uses the inner 2%-of-image-diagonal mask boundary from Cheng
+et al. (CVPR 2021), including boundaries at the image frame, following the
+authors' reference implementation. It is pooled from boundary pixel counts.
+https://github.com/bowenc0221/boundary-iou-api/blob/master/boundary_iou/utils/boundary_utils.py
 
 CLI:
     python -m eval.aeroswap_eval --checkpoint sky.pt [--split test] [--out report.json]
@@ -55,6 +60,25 @@ from models.aeroswap_data import SkyFinderDataset
 DEFAULT_ROOT = Path("data/skyfinder/processed")
 THRESHOLD = 0.5
 BATCH_SIZE = 8
+BOUNDARY_RATIO = 0.02
+
+
+def sky_boundary(mask, ratio=BOUNDARY_RATIO):
+    """Return the inner boundary of one 2-D binary sky mask."""
+    mask = np.asarray(mask, dtype=np.uint8)
+    if mask.ndim != 2:
+        raise ValueError("boundary mask must be 2-D")
+    height, width = mask.shape
+    distance = max(1, round(ratio * np.hypot(height, width)))
+    padded = cv2.copyMakeBorder(mask, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
+    eroded = cv2.erode(padded, np.ones((3, 3), dtype=np.uint8), iterations=distance)
+    return (mask - eroded[1:height + 1, 1:width + 1]).astype(bool)
+
+
+def boundary_pixel_counts(pred, true_boundary):
+    predicted_boundary = sky_boundary(pred)
+    return (int(np.logical_and(predicted_boundary, true_boundary).sum()),
+            int(np.logical_or(predicted_boundary, true_boundary).sum()))
 
 
 @dataclass
@@ -64,9 +88,11 @@ class Counts:
     union_sky: int = 0
     inter_bg: int = 0
     union_bg: int = 0
+    boundary_inter: int = 0
+    boundary_union: int = 0
     images: int = 0
 
-    def add(self, pred, true):
+    def add(self, pred, true, boundary_counts=None):
         if isinstance(pred, np.ndarray):
             p, t = pred.astype(bool, copy=False), true.astype(bool, copy=False)
         else:
@@ -75,12 +101,24 @@ class Counts:
         self.union_sky += int((p | t).sum())
         self.inter_bg += int((~p & ~t).sum())
         self.union_bg += int((~p | ~t).sum())
+        if boundary_counts is None:
+            boundary_counts = (0, 0)
+            for i in range(pred.shape[0]):
+                true_boundary = sky_boundary(np.asarray(t[i, 0]))
+                b_inter, b_union = boundary_pixel_counts(np.asarray(p[i, 0]), true_boundary)
+                boundary_counts = (boundary_counts[0] + b_inter,
+                                   boundary_counts[1] + b_union)
+        self.boundary_inter += boundary_counts[0]
+        self.boundary_union += boundary_counts[1]
         self.images += pred.shape[0]
 
     def metrics(self):
         sky = self.inter_sky / self.union_sky if self.union_sky else float("nan")
         bg = self.inter_bg / self.union_bg if self.union_bg else float("nan")
+        boundary = (self.boundary_inter / self.boundary_union
+                    if self.boundary_union else float("nan"))
         return {"images": self.images, "sky_iou": sky, "bg_iou": bg,
+                "sky_boundary_iou": boundary,
                 "miou": (sky + bg) / 2 if self.union_sky and self.union_bg else float("nan")}
 
 
@@ -93,7 +131,8 @@ class Report:
     by_condition: dict = field(default_factory=dict)    # 'day'/'night' -> metrics
 
     def to_json(self):
-        return {"split": self.split, "pooled": self.pooled,
+        return {"split": self.split, "sky_boundary_ratio": BOUNDARY_RATIO,
+                "pooled": self.pooled,
                 "mean_over_cameras_miou": self.mean_over_cameras,
                 "per_camera": self.per_camera, "by_condition": self.by_condition}
 
@@ -117,6 +156,7 @@ def evaluate(predict, root=DEFAULT_ROOT, split="test", threshold=THRESHOLD,
     per_condition = defaultdict(Counts)
 
     seen = 0
+    true_boundaries = {}
     for images, masks in loader:
         images = images.to(device)
         with torch.no_grad():
@@ -130,10 +170,13 @@ def evaluate(predict, root=DEFAULT_ROOT, split="test", threshold=THRESHOLD,
             cam = row["camera"]
             cond = "night" if str(row.get("night", "0")) == "1" else "day"
             p, t = pred[i:i + 1], true[i:i + 1]
-            pooled.add(p, t)
-            per_camera[cam].add(p, t)
-            per_camera_condition[(cam, cond)].add(p, t)
-            per_condition[cond].add(p, t)
+            if cam not in true_boundaries:
+                true_boundaries[cam] = sky_boundary(t[0, 0].numpy())
+            boundary_counts = boundary_pixel_counts(p[0, 0].numpy(), true_boundaries[cam])
+            pooled.add(p, t, boundary_counts)
+            per_camera[cam].add(p, t, boundary_counts)
+            per_camera_condition[(cam, cond)].add(p, t, boundary_counts)
+            per_condition[cond].add(p, t, boundary_counts)
         seen += pred.shape[0]
 
     return _make_report(split, pooled, per_camera, per_camera_condition, per_condition)
@@ -167,6 +210,7 @@ def evaluate_brightness_numpy(root=DEFAULT_ROOT, split="test", brightness=0.55,
     per_camera_condition = defaultdict(Counts)
     per_condition = defaultdict(Counts)
     masks = {}
+    true_boundaries = {}
     for row in rows:
         image_path = root / split / "images" / row["image"]
         image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
@@ -178,16 +222,18 @@ def evaluate_brightness_numpy(root=DEFAULT_ROOT, split="test", brightness=0.55,
             if mask is None:
                 raise OSError(f"unreadable mask: {mask_path}")
             masks[row["mask"]] = mask > 127
+            true_boundaries[row["mask"]] = sky_boundary(masks[row["mask"]])
         true = masks[row["mask"]][None, None]
         pred = ((image.astype(np.float32) / 255).mean(axis=2)[None, None] > brightness) > threshold
         if pred.shape != true.shape:
             raise ValueError(f"image and mask sizes differ: {image_path}")
         cam = row["camera"]
         cond = "night" if str(row.get("night", "0")) == "1" else "day"
-        pooled.add(pred, true)
-        per_camera[cam].add(pred, true)
-        per_camera_condition[(cam, cond)].add(pred, true)
-        per_condition[cond].add(pred, true)
+        boundary_counts = boundary_pixel_counts(pred[0, 0], true_boundaries[row["mask"]])
+        pooled.add(pred, true, boundary_counts)
+        per_camera[cam].add(pred, true, boundary_counts)
+        per_camera_condition[(cam, cond)].add(pred, true, boundary_counts)
+        per_condition[cond].add(pred, true, boundary_counts)
     return _make_report(split, pooled, per_camera, per_camera_condition, per_condition)
 
 
@@ -211,17 +257,19 @@ def print_report(report):
     print(f"\n{report.split}: {p['images']} images, "
           f"{len(report.per_camera)} cameras")
     print(f"  pooled            mIoU {p['miou']:.4f}   sky {p['sky_iou']:.4f}  bg {p['bg_iou']:.4f}")
+    print(f"  sky Boundary IoU  {p['sky_boundary_iou']:.4f} (2% image diagonal)")
     print(f"  mean over cameras mIoU {report.mean_over_cameras:.4f}")
     if report.by_condition:
         for cond, m in report.by_condition.items():
             print(f"  {cond:<5} (pooled)    mIoU {m['miou']:.4f}   sky {m['sky_iou']:.4f}  "
-                  f"bg {m['bg_iou']:.4f}  n={m['images']}")
-    print(f"\n  {'camera':>8} {'n':>6} {'mIoU':>8} {'sky':>8} {'bg':>8}  {'day mIoU':>9} {'night mIoU':>10}")
+                  f"bg {m['bg_iou']:.4f}  boundary {m['sky_boundary_iou']:.4f}  n={m['images']}")
+    print(f"\n  {'camera':>8} {'n':>6} {'mIoU':>8} {'sky':>8} {'bg':>8} "
+          f"{'boundary':>9}  {'day mIoU':>9} {'night mIoU':>10}")
     for cam, m in report.per_camera.items():
         day = f"{m['day']['miou']:.4f}" if "day" in m else "-"
         night = f"{m['night']['miou']:.4f}" if "night" in m else "-"
         print(f"  {cam:>8} {m['images']:>6} {m['miou']:>8.4f} {m['sky_iou']:>8.4f} "
-              f"{m['bg_iou']:>8.4f}  {day:>9} {night:>10}")
+              f"{m['bg_iou']:>8.4f} {m['sky_boundary_iou']:>9.4f}  {day:>9} {night:>10}")
 
 
 def main():
