@@ -68,3 +68,20 @@ Full precision and sky/background IoU for each camera and condition are in
 epochs, including validation scores. Model weights and test scores are
 versioned separately so the training milestone and evaluation are visible in
 Git history.
+
+## Visual error check
+
+`python -m eval.aeroswap_examples --checkpoint models/checkpoints/aeroswap_skyfinder_v1.ts`
+creates a local contact sheet in `data/aeroswap/examples.png`. It chooses the
+chronological midpoint from each test camera's day and night images without
+looking at model scores. The selected filenames and their per-image mIoU are
+in `aeroswap_examples.json`. Source photographs and the contact sheet remain
+in ignored `data/` and are not redistributed through this repository.
+
+Review of these six examples shows false sky on the domes of camera 204, the
+lit building in camera 9708, and red roof or facade regions in camera 10870.
+Some true sky is also missed at night. Even camera 10870's selected night
+frame scores 0.812 per-image mIoU while still marking part of a roof as sky.
+Pooled mIoU alone cannot establish that an automatic sky replacement will
+preserve building edges. The app should preview the mask and require user
+approval before replacement; boundary quality needs separate evaluation.
