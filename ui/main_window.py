@@ -19,8 +19,9 @@ without re-running post-processing; releasing a slider logs the value against
 the global default. Brackets that aren't classified (not fused yet, or
 classification failed) leave the sliders alone and log nothing.
 
-Sky-mask review runs on another worker thread and only changes the preview.
-It never changes the fused JPEG or applies a replacement sky.
+Sky-mask review runs on another worker thread. A user can choose a sky image,
+review the replacement, and save a separate sky version. Neither preview nor
+save modifies the original fused JPEG.
 """
 
 import sys
@@ -47,6 +48,7 @@ from core.prototype import (
 )
 from processing.scenesense import classify_scene, is_exterior
 from processing.sky_preview import mask_overlay, predict_sky_probability
+from processing.sky_replace import composite_sky, read_rgb, save_sky_version
 
 WARNING_COLOR = QColor("#b36b00")
 OK_COLOR = QColor("#2e7d32")
@@ -206,7 +208,7 @@ class PreviewWorker(QObject):
 class SkyPreviewWorker(QObject):
     """Generate a mask overlay without changing the fused JPEG."""
 
-    ready = Signal(int, object, float, bool, float, str)
+    ready = Signal(int, object, object, float, bool, float, str)
     finished = Signal()
 
     def __init__(self, index, after_path):
@@ -225,10 +227,61 @@ class SkyPreviewWorker(QObject):
             rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
             probability = predict_sky_probability(rgb)
             overlay, coverage = mask_overlay(rgb, probability)
-            self.ready.emit(self.index, to_qimage(overlay), coverage,
+            self.ready.emit(self.index, to_qimage(overlay), probability, coverage,
                             exterior, confidence, "")
         except Exception as e:
-            self.ready.emit(self.index, None, 0.0, False, 0.0, str(e))
+            self.ready.emit(self.index, None, None, 0.0, False, 0.0, str(e))
+        finally:
+            self.finished.emit()
+
+
+class SkyCompositeWorker(QObject):
+    """Build a replacement preview after the user chooses a sky image."""
+
+    ready = Signal(int, object, object, str)  # index, QImage, sky path, error
+    finished = Signal()
+
+    def __init__(self, index, fused_path, sky_path, probability):
+        super().__init__()
+        self.index = index
+        self.fused_path = fused_path
+        self.sky_path = sky_path
+        self.probability = probability
+
+    @Slot()
+    def run(self):
+        try:
+            fused = downscale(read_rgb(self.fused_path))
+            sky = read_rgb(self.sky_path)
+            preview = composite_sky(fused, sky, self.probability)
+            self.ready.emit(self.index, to_qimage(preview), self.sky_path, "")
+        except Exception as e:
+            self.ready.emit(self.index, None, self.sky_path, str(e))
+        finally:
+            self.finished.emit()
+
+
+class SkySaveWorker(QObject):
+    """Save a separate full-resolution sky version after visual approval."""
+
+    done = Signal(int, object, str)  # index, output path, error
+    finished = Signal()
+
+    def __init__(self, index, fused_path, sky_path, probability, output_path):
+        super().__init__()
+        self.index = index
+        self.fused_path = fused_path
+        self.sky_path = sky_path
+        self.probability = probability
+        self.output_path = output_path
+
+    @Slot()
+    def run(self):
+        try:
+            save_sky_version(self.fused_path, self.sky_path, self.probability, self.output_path)
+            self.done.emit(self.index, self.output_path, "")
+        except Exception as e:
+            self.done.emit(self.index, self.output_path, str(e))
         finally:
             self.finished.emit()
 
@@ -396,8 +449,10 @@ class MainWindow(QMainWindow):
         self._scene_types = {}           # bracket index -> SceneSense label
         self._sky_thread = None
         self._sky_worker = None
-        self._sky_cache = {}             # bracket index -> overlay, coverage, exterior, confidence
+        self._sky_cache = {}             # bracket index -> overlay, probability, coverage, exterior, confidence
+        self._sky_composite_cache = {}   # bracket index -> composite QImage, chosen sky path
         self._sky_display_index = None   # overlay currently shown in the After pane
+        self._sky_display_mode = None    # mask, composite, or None
 
         # Fused images before post-processing, most recently used last.
         self._fused_cache = OrderedDict()  # bracket index -> (FuseSettings, RGB uint8)
@@ -445,6 +500,10 @@ class MainWindow(QMainWindow):
         self.preview_status.setWordWrap(True)
         self.sky_button = QPushButton("Preview sky mask")
         self.sky_button.setEnabled(False)
+        self.choose_sky_button = QPushButton("Choose sky…")
+        self.choose_sky_button.setEnabled(False)
+        self.save_sky_button = QPushButton("Save sky version…")
+        self.save_sky_button.setEnabled(False)
         self.photo_button = QPushButton("Show photo")
         self.photo_button.setEnabled(False)
         for caption in (self.before_caption, self.after_caption):
@@ -467,9 +526,12 @@ class MainWindow(QMainWindow):
             panes.addLayout(column, 1)
         preview_rows = QVBoxLayout()
         preview_rows.addLayout(panes, 1)
+        preview_rows.addWidget(self.preview_status)
         preview_controls = QHBoxLayout()
-        preview_controls.addWidget(self.preview_status, 1)
+        preview_controls.addStretch(1)
         preview_controls.addWidget(self.sky_button)
+        preview_controls.addWidget(self.choose_sky_button)
+        preview_controls.addWidget(self.save_sky_button)
         preview_controls.addWidget(self.photo_button)
         preview_rows.addLayout(preview_controls)
         preview_panel = QWidget()
@@ -505,6 +567,8 @@ class MainWindow(QMainWindow):
         self.output_button.clicked.connect(self.choose_output)
         self.process_button.clicked.connect(self.process_or_cancel)
         self.sky_button.clicked.connect(self.preview_sky_selected)
+        self.choose_sky_button.clicked.connect(self.choose_sky_selected)
+        self.save_sky_button.clicked.connect(self.save_sky_selected)
         self.photo_button.clicked.connect(self.show_photo_selected)
         self.list.currentItemChanged.connect(self.on_list_selection)
         for slider, value_range in ((self.contrast, CONTRAST_RANGE), (self.saturation, SATURATION_RANGE)):
@@ -613,8 +677,10 @@ class MainWindow(QMainWindow):
         self.progress.setValue(self.progress.value() + 1)
         self._preview_cache.pop(i, None)  # the file on disk was just rewritten
         self._sky_cache.pop(i, None)
+        self._sky_composite_cache.pop(i, None)
         if self._sky_display_index == i:
             self._sky_display_index = None
+            self._sky_display_mode = None
         if ok:
             self.results[i] = (before_path, after_path)
             self.show_preview(i)
@@ -722,18 +788,21 @@ class MainWindow(QMainWindow):
         thread.finished.connect(self.on_post_thread_finished)
         self._post_thread, self._post_worker = thread, worker
         self.process_button.setEnabled(False)
+        self.update_sky_buttons()
         self.status.setText(f"Applying contrast {clahe_clip:.1f}, saturation {saturation:.2f} "
                             f"to bracket {index + 1}…")
         thread.start()
 
     @Slot(int, object, float, str)
     def on_post_done(self, index, after, seconds, error):
+        self._sky_cache.pop(index, None)
+        self._sky_composite_cache.pop(index, None)
+        if self._sky_display_index == index:
+            self._sky_display_index = None
+            self._sky_display_mode = None
         if error:
             self.status.setText(f"Contrast/saturation failed on bracket {index + 1}: {error}")
             return
-        self._sky_cache.pop(index, None)
-        if self._sky_display_index == index:
-            self._sky_display_index = None
         if index in self._preview_cache:
             before, _old_after, sizes = self._preview_cache[index]
             self._preview_cache[index] = (before, after, sizes)  # same pixels size, so sizes still hold
@@ -760,7 +829,26 @@ class MainWindow(QMainWindow):
                  and not self._busy and self._post_thread is None
                  and self._sky_thread is None and not self._post_timer.isActive())
         self.sky_button.setEnabled(ready)
+        confirmed_exterior = index in self._sky_cache and self._sky_cache[index][3]
+        self.choose_sky_button.setEnabled(ready and confirmed_exterior)
+        self.save_sky_button.setEnabled(
+            ready and confirmed_exterior and index in self._sky_composite_cache
+            and self._sky_display_index == index and self._sky_display_mode == "composite")
         self.photo_button.setEnabled(index is not None and self._sky_display_index == index)
+
+    def start_sky_task(self, worker, result_signal, result_slot, message):
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        result_signal.connect(result_slot)
+        worker.finished.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self.on_sky_thread_finished)
+        self._sky_thread, self._sky_worker = thread, worker
+        self.set_busy(self._busy)
+        self.preview_status.setText(message)
+        thread.start()
 
     @Slot()
     def preview_sky_selected(self):
@@ -772,39 +860,104 @@ class MainWindow(QMainWindow):
             self.show_sky_overlay(index)
             return
         worker = SkyPreviewWorker(index, self.results[index][1])
-        thread = QThread(self)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.ready.connect(self.on_sky_ready)
-        worker.finished.connect(thread.quit)
-        thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(self.on_sky_thread_finished)
-        self._sky_thread, self._sky_worker = thread, worker
-        self.set_busy(self._busy)
-        self.preview_status.setText(f"Checking sky in bracket {index + 1}… original photo unchanged.")
-        thread.start()
+        self.start_sky_task(worker, worker.ready, self.on_sky_ready,
+                            f"Checking sky in bracket {index + 1}… original photo unchanged.")
 
-    @Slot(int, object, float, bool, float, str)
-    def on_sky_ready(self, index, overlay, coverage, exterior, confidence, error):
+    @Slot(int, object, object, float, bool, float, str)
+    def on_sky_ready(self, index, overlay, probability, coverage, exterior, confidence, error):
         if error:
             if index == self.selected_index():
                 self.preview_status.setText(f"Sky preview failed: {error}")
             return
-        self._sky_cache[index] = (overlay, coverage, exterior, confidence)
+        self._sky_cache[index] = (overlay, probability, coverage, exterior, confidence)
         if index == self.selected_index():
             self.show_sky_overlay(index)
 
     def show_sky_overlay(self, index):
-        overlay, coverage, exterior, confidence = self._sky_cache[index]
+        overlay, _probability, coverage, exterior, confidence = self._sky_cache[index]
         self.after_pane.set_image(overlay)
         self.after_caption.setText("After — predicted sky highlighted (preview only)")
         self._sky_display_index = index
+        self._sky_display_mode = "mask"
         scene = (f"SceneSense: exterior ({confidence:.2f})" if exterior else
                  "SceneSense: exterior not confirmed; this may be a ceiling or wall")
         self.preview_status.setText(
             f"AeroSwap marked {coverage:.0%} as sky. {scene}. Original output unchanged.")
         self.update_sky_buttons()
+
+    @Slot()
+    def choose_sky_selected(self):
+        index = self.selected_index()
+        if (index not in self._sky_cache or not self._sky_cache[index][3]
+                or self._busy or self._post_thread is not None or self._sky_thread is not None
+                or self._post_timer.isActive()):
+            return
+        filename, _filter = QFileDialog.getOpenFileName(
+            self, "Choose a replacement sky image", str(self.input_dir or Path.home()),
+            "Images (*.jpg *.jpeg *.png)")
+        if not filename:
+            return
+        probability = self._sky_cache[index][1]
+        worker = SkyCompositeWorker(index, self.results[index][1], Path(filename), probability)
+        self.start_sky_task(worker, worker.ready, self.on_sky_composite_ready,
+                            "Building sky version preview… original photo unchanged.")
+
+    @Slot(int, object, object, str)
+    def on_sky_composite_ready(self, index, preview, sky_path, error):
+        if error:
+            if index == self.selected_index():
+                self.preview_status.setText(f"Sky version preview failed: {error}")
+            return
+        self._sky_composite_cache[index] = (preview, sky_path)
+        if index == self.selected_index():
+            self.show_sky_composite(index)
+
+    def show_sky_composite(self, index):
+        preview, _sky_path = self._sky_composite_cache[index]
+        self.after_pane.set_image(preview)
+        self.after_caption.setText("After — sky version preview (not saved)")
+        self._sky_display_index = index
+        self._sky_display_mode = "composite"
+        self.preview_status.setText(
+            "Review the roofline and buildings carefully. Save sky version writes a new file; "
+            "the original remains unchanged.")
+        self.update_sky_buttons()
+
+    @Slot()
+    def save_sky_selected(self):
+        index = self.selected_index()
+        if (index not in self._sky_composite_cache or self._sky_display_index != index
+                or self._sky_display_mode != "composite" or index not in self._sky_cache
+                or not self._sky_cache[index][3] or self._busy or self._post_thread is not None
+                or self._sky_thread is not None or self._post_timer.isActive()):
+            return
+        fused_path = self.results[index][1]
+        suggested = fused_path.with_name(fused_path.stem + "_sky.jpg")
+        filename, _filter = QFileDialog.getSaveFileName(
+            self, "Save a separate sky version", str(suggested),
+            "JPEG image (*.jpg *.jpeg);;PNG image (*.png)")
+        if not filename:
+            return
+        output_path = Path(filename)
+        if not output_path.suffix:
+            output_path = output_path.with_suffix(".jpg")
+        sky_path = self._sky_composite_cache[index][1]
+        if output_path.resolve() in (fused_path.resolve(), sky_path.resolve()):
+            self.preview_status.setText("Choose a new filename; input photos cannot be overwritten.")
+            return
+        probability = self._sky_cache[index][1]
+        worker = SkySaveWorker(index, fused_path, sky_path, probability, output_path)
+        self.start_sky_task(worker, worker.done, self.on_sky_saved,
+                            f"Saving sky version for bracket {index + 1}…")
+
+    @Slot(int, object, str)
+    def on_sky_saved(self, index, output_path, error):
+        if error:
+            self.preview_status.setText(f"Sky version could not be saved: {error}")
+            return
+        self.preview_status.setText(
+            f"Saved {Path(output_path).name}. Original fused photo remains unchanged.")
+        self.status.setText(f"Sky version saved to {output_path}")
 
     @Slot()
     def show_photo_selected(self):
@@ -829,10 +982,12 @@ class MainWindow(QMainWindow):
         index = item.data(Qt.UserRole)
         if index is not None:
             self._sky_display_index = None
+            self._sky_display_mode = None
             self.apply_learned_defaults(index)
             self.show_preview(index)
         else:
             self._sky_display_index = None
+            self._sky_display_mode = None
         self.update_sky_buttons()
 
     def show_preview(self, index):
@@ -888,6 +1043,7 @@ class MainWindow(QMainWindow):
         self.before_pane.set_image(before)
         self.after_pane.set_image(after)
         self._sky_display_index = None
+        self._sky_display_mode = None
         self.before_caption.setText(f"Before — {before_path.name} (middle exposure)")
         self.after_caption.setText(f"After — {after_path.name}")
         # Real file dimensions, not the scaled-to-fit preview the panes are showing.
@@ -903,7 +1059,9 @@ class MainWindow(QMainWindow):
         self._results_half_size = {}
         self._scene_types = {}
         self._sky_cache = {}
+        self._sky_composite_cache = {}
         self._sky_display_index = None
+        self._sky_display_mode = None
         self.before_pane.clear_image()
         self.after_pane.clear_image()
         self.before_caption.setText("Before")

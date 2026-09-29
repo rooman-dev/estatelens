@@ -45,5 +45,18 @@ process pipe.
 In the desktop app, process a bracket, select its row, and click **Preview sky
 mask**. Blue shows pixels AeroSwap would call sky; the yellow line shows the
 predicted boundary. SceneSense warns when the photo is not confirmed as an
-exterior. **Show photo** returns to the normal after view. This is review only:
-no replacement sky is applied, and the fused JPEG remains unchanged.
+exterior; **Choose sky** remains disabled for those photos. On a confirmed
+exterior, **Choose sky** accepts a JPEG or PNG and shows the full replacement
+preview. **Save sky version** asks for a new filename and writes a separate
+image only after that preview is visible. **Show photo** returns to the normal
+after view. Neither preview nor save overwrites the fused JPEG or the sky
+source image.
+SceneSense may decline some genuine exteriors; those require a later reviewed
+override rather than silently bypassing the gate.
+
+The save flow has been checked on a SkyFinder exterior with a generated test
+sky. It is a functional check, not validation on real estate exteriors. In
+that test the model wrongly replaces parts of a roof, so the preview must be
+reviewed carefully. The current dataset of 15 real property brackets contains
+interiors only; an exterior property example is still needed to evaluate the
+feature for its intended use.
