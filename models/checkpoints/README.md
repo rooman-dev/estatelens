@@ -26,3 +26,18 @@ SHA-256: `5e2015d5d9e5b5a60be9ac966713f020cba609a8aa52cd913ac486bce93f1069`
 TorchScript worked in the pinned PyTorch 2.14.0 environment, although PyTorch
 warns that its JIT API is not supported on Python 3.14 and could break in a
 future release. Verify loading and inference after changing the runtime.
+
+For desktop sky-mask previews, `models.infer_sky` reads an encoded image from
+stdin and returns a 512x512 probability PNG on stdout. The desktop-side helper
+in `processing/sky_preview.py` invokes it in a separate process. By default it
+uses the desktop Python environment. On a machine where PyTorch runs in WSL,
+create an ignored `data/sky_runtime.json` containing a command argument list,
+for example:
+
+```json
+["wsl", "--", "/home/your-user/venv/bin/python", "-m", "models.infer_sky"]
+```
+
+The current development PC has this local configuration. Paths to the photo
+are never sent to WSL; the image and mask travel as PNG bytes through the
+process pipe.
