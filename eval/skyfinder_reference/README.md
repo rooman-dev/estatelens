@@ -33,3 +33,38 @@ python -m eval.verify_skyfinder
 
 The verification counts and per-camera image totals are in
 `prepared_summary.json`.
+
+## AeroSwap v1 result
+
+The trained model is in `models/checkpoints/aeroswap_skyfinder_v1.ts`; its
+training recipe and artifact hash are in that directory's README. The model
+was selected by validation performance only. The full 4,880-image test split
+was then evaluated in the WSL training environment with the same pooled
+pixel-count mIoU code used for the brightness baseline:
+
+```shell
+python -m eval.aeroswap_eval --checkpoint models/checkpoints/aeroswap_skyfinder_v1.ts --device cuda --batch-size 2
+```
+
+| Test group | Images | Brightness baseline | AeroSwap v1 | Change |
+| --- | ---: | ---: | ---: | ---: |
+| All images, pooled | 4,880 | 0.5377 | 0.6627 | +0.1250 |
+| Day, pooled | 2,208 | 0.6023 | 0.7204 | +0.1181 |
+| Night, pooled | 2,672 | 0.4832 | 0.6180 | +0.1347 |
+| Mean over cameras | 3 cameras | 0.5103 | 0.6125 | +0.1022 |
+| Camera 204 | 2,494 | 0.5067 | 0.7183 | +0.2116 |
+| Camera 9708 | 750 | 0.3979 | 0.5217 | +0.1239 |
+| Camera 10870 | 1,636 | 0.6263 | 0.5974 | -0.0289 |
+
+The model clears the pooled baseline and improves both pooled day and night
+scores. It remains weaker than the baseline on camera 10870, especially by
+day (0.7272 versus 0.7835). This is only three held-out camera viewpoints;
+the pooled score is heavily influenced by camera 204's 2,494 images. We
+should inspect actual mask overlays and measure boundary quality before
+claiming the model makes replacement look convincing on real properties.
+
+Full precision and sky/background IoU for each camera and condition are in
+`aeroswap_test.json`. `aeroswap_training.jsonl` records all four training
+epochs, including validation scores. Model weights and test scores are
+versioned separately so the training milestone and evaluation are visible in
+Git history.
