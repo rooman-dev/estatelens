@@ -61,7 +61,7 @@ class AeroSwapNet(nn.Module):
         self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
         self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
 
-    def forward(self, image):
+    def forward_logits(self, image):
         x = (image - self.mean) / self.std
         x2 = self.enc2(x)
         x4 = self.enc4(x2)
@@ -73,4 +73,7 @@ class AeroSwapNet(nn.Module):
         x = self.up4(x, x4)
         x = self.up2(x, x2)
         x = F.interpolate(x, size=[image.size(2), image.size(3)], mode="bilinear", align_corners=False)
-        return torch.sigmoid(self.head(self.final(x)))
+        return self.head(self.final(x))
+
+    def forward(self, image):
+        return torch.sigmoid(self.forward_logits(image))

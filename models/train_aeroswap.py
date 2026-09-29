@@ -53,8 +53,10 @@ def sampled_indices(rows, per_camera, seed):
     return sorted(chosen)
 
 
-def segmentation_loss(probability, target):
-    bce = F.binary_cross_entropy(probability, target)
+def segmentation_loss(logits, target):
+    logits = logits.float()
+    probability = torch.sigmoid(logits)
+    bce = F.binary_cross_entropy_with_logits(logits, target)
     intersection = (probability * target).sum(dim=(1, 2, 3))
     total = probability.sum(dim=(1, 2, 3)) + target.sum(dim=(1, 2, 3))
     dice = (2 * intersection + 1) / (total + 1)
@@ -69,8 +71,9 @@ def pooled_miou(model, loader, device):
         for image, target in loader:
             image = image.to(device, non_blocking=True)
             target = target.to(device, non_blocking=True)
-            probability = model(image)
-            loss_sum += segmentation_loss(probability, target).item() * image.shape[0]
+            logits = model.forward_logits(image)
+            probability = torch.sigmoid(logits)
+            loss_sum += segmentation_loss(logits, target).item() * image.shape[0]
             samples += image.shape[0]
             pred = probability > 0.5
             true = target > 0.5
@@ -162,7 +165,8 @@ def train(args):
             image = image.to(device, non_blocking=True)
             target = target.to(device, non_blocking=True)
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
-                loss = segmentation_loss(model(image), target)
+                logits = model.forward_logits(image)
+            loss = segmentation_loss(logits, target)
             window_start = ((step - 1) // args.accumulate) * args.accumulate
             window_size = min(args.accumulate, steps_this_epoch - window_start)
             scaler.scale(loss / window_size).backward()
