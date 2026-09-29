@@ -20,4 +20,16 @@ The full per-camera and day/night report is in `baseline.json`.
 
 The test-only preparation used the three test camera archives and the committed
 reference settings. It did not need train or validation camera archives. The
-training and validation data must still be prepared before model training.
+full preparation has now been verified from its written CSV and image files:
+7,845 training images across 9 cameras, 1,944 validation images across 3 cameras,
+and 4,880 test images across 3 cameras. No camera occurs in two splits. The
+full preparation's test baseline report is identical to `baseline.json`.
+
+To verify a prepared dataset again:
+
+```powershell
+python -m eval.verify_skyfinder
+```
+
+The verification counts and per-camera image totals are in
+`prepared_summary.json`.

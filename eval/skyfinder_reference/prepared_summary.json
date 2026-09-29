@@ -1,0 +1,42 @@
+{
+  "source": "SkyFinder Zenodo record 5884485",
+  "image_size": 512,
+  "splits": {
+    "train": {
+      "cameras": 9,
+      "images": 7845,
+      "night_images": 0,
+      "images_per_camera": {
+        "65": 1551,
+        "3395": 571,
+        "4181": 835,
+        "7211": 1263,
+        "8438": 494,
+        "8953": 470,
+        "19106": 391,
+        "21510": 1414,
+        "24325": 856
+      }
+    },
+    "val": {
+      "cameras": 3,
+      "images": 1944,
+      "night_images": 0,
+      "images_per_camera": {
+        "861": 641,
+        "4679": 484,
+        "17218": 819
+      }
+    },
+    "test": {
+      "cameras": 3,
+      "images": 4880,
+      "night_images": 2672,
+      "images_per_camera": {
+        "204": 2494,
+        "9708": 750,
+        "10870": 1636
+      }
+    }
+  }
+}
