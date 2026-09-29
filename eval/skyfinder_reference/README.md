@@ -85,3 +85,28 @@ frame scores 0.812 per-image mIoU while still marking part of a roof as sky.
 Pooled mIoU alone cannot establish that an automatic sky replacement will
 preserve building edges. The app should preview the mask and require user
 approval before replacement; boundary quality needs separate evaluation.
+
+## Sky Boundary IoU
+
+The evaluator now also reports sky Boundary IoU, following
+[Cheng et al. (CVPR 2021)](https://openaccess.thecvf.com/content/CVPR2021/html/Cheng_Boundary_IoU_Improving_Object-Centric_Image_Segmentation_Evaluation_CVPR_2021_paper.html)
+and the [authors' mask boundary procedure](https://github.com/bowenc0221/boundary-iou-api/blob/master/boundary_iou/utils/boundary_utils.py).
+The inner boundary band is 2% of the image diagonal (14 pixels for 512x512).
+Like the authors' procedure, this includes mask boundaries at the image frame;
+it is sensitive to roofline errors but is not a roofline-only measure. Counts
+are pooled before division, as with mIoU.
+
+| Test group | Brightness baseline | AeroSwap v1 | Change |
+| --- | ---: | ---: | ---: |
+| All images, pooled | 0.2824 | 0.3045 | +0.0221 |
+| Day, pooled | 0.3338 | 0.3372 | +0.0034 |
+| Night, pooled | 0.2339 | 0.2787 | +0.0448 |
+| Camera 204 | 0.3580 | 0.3375 | -0.0206 |
+| Camera 9708 | 0.1068 | 0.1922 | +0.0854 |
+| Camera 10870 | 0.3072 | 0.2936 | -0.0135 |
+
+The overall boundary improvement is small beside the +0.1250 pooled mIoU
+gain. Boundary IoU is lower than the baseline on cameras 204 and 10870.
+Automatic replacement would therefore be premature. The updated JSON reports
+contain full-precision boundary scores for every camera and day/night group;
+the original mIoU values are unchanged.
