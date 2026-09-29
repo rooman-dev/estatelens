@@ -1,7 +1,7 @@
 # EstateLens: Hadeed's progress record
 
-**As of:** 30 September 2026  
-**Project:** EstateLens, Air University BSCS FYP  
+**As of:** 30 September 2026
+**Project:** EstateLens, Air University BSCS FYP
 **Current assignment before the presentation:** visual review of 15 real bracket outputs
 
 This is a record of work and evidence, not a claim that three image-processing
@@ -22,7 +22,7 @@ not be used to claim independent implementation.
 | Work | Evidence | Current result |
 | --- | --- | --- |
 | Support mixed RAW/JPEG bracket datasets, including `.ORF` and `.SRW` RAW files and matching camera JPEGs | `ea7917d` | The supplied dataset can be scanned without counting a RAW+JPEG pair as two exposures. Two grouping regression tests cover this path. |
-| Run real interior exposure brackets through the batch pipeline | Local `data/reddit_bkt/batch.db` and `data/reddit_bkt/batch/` | 15 of 15 jobs marked complete; all 15 output JPEGs exist; no recorded job errors. Input and output photos are ignored by Git. This verifies processing completed, not that every image looks good. |
+| Run real exposure brackets through the batch pipeline | Local `data/reddit_bkt/batch.db` and `data/reddit_bkt/batch/` | 15 of 15 jobs marked complete; all 15 output JPEGs exist; no recorded job errors. Only four show furnished homes; the rest include damaged/industrial and outdoor scenes. Input and output photos are ignored by Git. This verifies processing completed, not that every image looks good. |
 | Add a tiled-versus-whole fusion regression check | `badc6e6`, `tests/test_tiled_fusion.py` | Two tests exercise the single-tile path and compare multi-tile output with whole-image fusion on a synthetic interior-like scene. |
 
 The full automated suite currently reports **13 passing tests**. Most of these
@@ -60,10 +60,13 @@ project phase and is not presented as a finished FYP-I module.
 
 ## Current work and later work
 
-**Before the presentation:** review each of the 15 outputs for usable window
-views, flat-wall and ceiling artifacts, TrueVertical corrections/crops, ghosting,
-colour casts and halos. Keep screenshots of the best examples and every failure.
-Report findings to Rooman for tuning decisions. Do not retune or refactor first.
+**Before the presentation:** the visual review of all 15 outputs is recorded in
+[`interior_visual_review_2026-09-30.md`](interior_visual_review_2026-09-30.md).
+The local `data/reddit_bkt/review_share.zip` holds before/after screenshots for
+all 15. The review found two damaging perspective corrections, weak room/window
+balance in several examples, and a dataset gap for the main real-estate claim.
+The report and evidence are ready for Hadeed to share with Rooman for tuning
+decisions. No retuning or refactoring was done.
 
 **After the presentation:** move ChromaRaw, LumaMerge and TrueVertical to
 standalone `processing/` modules and re-measure the published results; add
