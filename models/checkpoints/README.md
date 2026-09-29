@@ -41,3 +41,9 @@ for example:
 The current development PC has this local configuration. Paths to the photo
 are never sent to WSL; the image and mask travel as PNG bytes through the
 process pipe.
+
+In the desktop app, process a bracket, select its row, and click **Preview sky
+mask**. Blue shows pixels AeroSwap would call sky; the yellow line shows the
+predicted boundary. SceneSense warns when the photo is not confirmed as an
+exterior. **Show photo** returns to the normal after view. This is review only:
+no replacement sky is applied, and the fused JPEG remains unchanged.

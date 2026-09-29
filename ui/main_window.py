@@ -18,6 +18,9 @@ Selecting a classified bracket sets the sliders to echolearn.get_defaults(scene)
 without re-running post-processing; releasing a slider logs the value against
 the global default. Brackets that aren't classified (not fused yet, or
 classification failed) leave the sliders alone and log nothing.
+
+Sky-mask review runs on another worker thread and only changes the preview.
+It never changes the fused JPEG or applies a replacement sky.
 """
 
 import sys
@@ -42,7 +45,8 @@ from core.prototype import (
     CLAHE_CLIP, JPEG_EXTS, SATURATION, TIFF_EXTS, brightness, describe_exposure,
     enhance_and_save, exposure_order, find_frames, fuse_to_image, group_brackets,
 )
-from processing.scenesense import classify_scene
+from processing.scenesense import classify_scene, is_exterior
+from processing.sky_preview import mask_overlay, predict_sky_probability
 
 WARNING_COLOR = QColor("#b36b00")
 OK_COLOR = QColor("#2e7d32")
@@ -195,6 +199,36 @@ class PreviewWorker(QObject):
             self.ready.emit(self.index, before, after, (before_size, after_size), "")
         except Exception as e:
             self.ready.emit(self.index, None, None, None, str(e))
+        finally:
+            self.finished.emit()
+
+
+class SkyPreviewWorker(QObject):
+    """Generate a mask overlay without changing the fused JPEG."""
+
+    ready = Signal(int, object, float, bool, float, str)
+    finished = Signal()
+
+    def __init__(self, index, after_path):
+        super().__init__()
+        self.index = index
+        self.after_path = after_path
+
+    @Slot()
+    def run(self):
+        try:
+            fused = cv2.imread(str(self.after_path), cv2.IMREAD_COLOR)
+            if fused is None:
+                raise ValueError(f"could not read {self.after_path.name}")
+            small = downscale(fused)
+            exterior, confidence = is_exterior(small, db_path=None)
+            rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+            probability = predict_sky_probability(rgb)
+            overlay, coverage = mask_overlay(rgb, probability)
+            self.ready.emit(self.index, to_qimage(overlay), coverage,
+                            exterior, confidence, "")
+        except Exception as e:
+            self.ready.emit(self.index, None, 0.0, False, 0.0, str(e))
         finally:
             self.finished.emit()
 
@@ -360,6 +394,10 @@ class MainWindow(QMainWindow):
         self._preview_pending = None # queued while a decode is in flight
         self._results_half_size = {}     # bracket index -> half-size option its output was fused with
         self._scene_types = {}           # bracket index -> SceneSense label
+        self._sky_thread = None
+        self._sky_worker = None
+        self._sky_cache = {}             # bracket index -> overlay, coverage, exterior, confidence
+        self._sky_display_index = None   # overlay currently shown in the After pane
 
         # Fused images before post-processing, most recently used last.
         self._fused_cache = OrderedDict()  # bracket index -> (FuseSettings, RGB uint8)
@@ -405,6 +443,10 @@ class MainWindow(QMainWindow):
         self.after_caption = QLabel("After")
         self.preview_status = QLabel("Fuse a bracket, or click one that is already done.")
         self.preview_status.setWordWrap(True)
+        self.sky_button = QPushButton("Preview sky mask")
+        self.sky_button.setEnabled(False)
+        self.photo_button = QPushButton("Show photo")
+        self.photo_button.setEnabled(False)
         for caption in (self.before_caption, self.after_caption):
             caption.setAlignment(Qt.AlignCenter)
 
@@ -425,7 +467,11 @@ class MainWindow(QMainWindow):
             panes.addLayout(column, 1)
         preview_rows = QVBoxLayout()
         preview_rows.addLayout(panes, 1)
-        preview_rows.addWidget(self.preview_status)
+        preview_controls = QHBoxLayout()
+        preview_controls.addWidget(self.preview_status, 1)
+        preview_controls.addWidget(self.sky_button)
+        preview_controls.addWidget(self.photo_button)
+        preview_rows.addLayout(preview_controls)
         preview_panel = QWidget()
         preview_panel.setLayout(preview_rows)
 
@@ -458,6 +504,8 @@ class MainWindow(QMainWindow):
         self.input_button.clicked.connect(self.choose_input)
         self.output_button.clicked.connect(self.choose_output)
         self.process_button.clicked.connect(self.process_or_cancel)
+        self.sky_button.clicked.connect(self.preview_sky_selected)
+        self.photo_button.clicked.connect(self.show_photo_selected)
         self.list.currentItemChanged.connect(self.on_list_selection)
         for slider, value_range in ((self.contrast, CONTRAST_RANGE), (self.saturation, SATURATION_RANGE)):
             slider.valueChanged.connect(
@@ -564,11 +612,15 @@ class MainWindow(QMainWindow):
         item.setForeground(OK_COLOR if ok else FAIL_COLOR)
         self.progress.setValue(self.progress.value() + 1)
         self._preview_cache.pop(i, None)  # the file on disk was just rewritten
+        self._sky_cache.pop(i, None)
+        if self._sky_display_index == i:
+            self._sky_display_index = None
         if ok:
             self.results[i] = (before_path, after_path)
             self.show_preview(i)
         else:
             self._fused_cache.pop(i, None)
+        self.update_sky_buttons()
 
     # --- contrast / saturation -----------------------------------------------------
 
@@ -589,6 +641,7 @@ class MainWindow(QMainWindow):
         # never press the handle, so they only arrive here; the timer merges bursts.
         if not slider.isSliderDown():
             self._post_timer.start()
+        self.update_sky_buttons()
 
     # --- EchoLearn ------------------------------------------------------------------
 
@@ -678,6 +731,9 @@ class MainWindow(QMainWindow):
         if error:
             self.status.setText(f"Contrast/saturation failed on bracket {index + 1}: {error}")
             return
+        self._sky_cache.pop(index, None)
+        if self._sky_display_index == index:
+            self._sky_display_index = None
         if index in self._preview_cache:
             before, _old_after, sizes = self._preview_cache[index]
             self._preview_cache[index] = (before, after, sizes)  # same pixels size, so sizes still hold
@@ -696,6 +752,73 @@ class MainWindow(QMainWindow):
         if pending is not None:
             self.reprocess(pending)
 
+    # --- sky-mask review -------------------------------------------------------
+
+    def update_sky_buttons(self):
+        index = self.selected_index()
+        ready = (index in self.results and index in self._preview_cache
+                 and not self._busy and self._post_thread is None
+                 and self._sky_thread is None and not self._post_timer.isActive())
+        self.sky_button.setEnabled(ready)
+        self.photo_button.setEnabled(index is not None and self._sky_display_index == index)
+
+    @Slot()
+    def preview_sky_selected(self):
+        index = self.selected_index()
+        if (index not in self.results or self._busy or self._post_thread is not None
+                or self._sky_thread is not None or self._post_timer.isActive()):
+            return
+        if index in self._sky_cache:
+            self.show_sky_overlay(index)
+            return
+        worker = SkyPreviewWorker(index, self.results[index][1])
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.ready.connect(self.on_sky_ready)
+        worker.finished.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self.on_sky_thread_finished)
+        self._sky_thread, self._sky_worker = thread, worker
+        self.set_busy(self._busy)
+        self.preview_status.setText(f"Checking sky in bracket {index + 1}… original photo unchanged.")
+        thread.start()
+
+    @Slot(int, object, float, bool, float, str)
+    def on_sky_ready(self, index, overlay, coverage, exterior, confidence, error):
+        if error:
+            if index == self.selected_index():
+                self.preview_status.setText(f"Sky preview failed: {error}")
+            return
+        self._sky_cache[index] = (overlay, coverage, exterior, confidence)
+        if index == self.selected_index():
+            self.show_sky_overlay(index)
+
+    def show_sky_overlay(self, index):
+        overlay, coverage, exterior, confidence = self._sky_cache[index]
+        self.after_pane.set_image(overlay)
+        self.after_caption.setText("After — predicted sky highlighted (preview only)")
+        self._sky_display_index = index
+        scene = (f"SceneSense: exterior ({confidence:.2f})" if exterior else
+                 "SceneSense: exterior not confirmed; this may be a ceiling or wall")
+        self.preview_status.setText(
+            f"AeroSwap marked {coverage:.0%} as sky. {scene}. Original output unchanged.")
+        self.update_sky_buttons()
+
+    @Slot()
+    def show_photo_selected(self):
+        index = self.selected_index()
+        if index in self._preview_cache:
+            self.display_preview(index, *self._preview_cache[index])
+
+    @Slot()
+    def on_sky_thread_finished(self):
+        self._sky_thread = self._sky_worker = None
+        self.set_busy(self._busy)
+        if self._close_pending:
+            self.close()
+
     # --- before/after preview --------------------------------------------------
 
     @Slot()
@@ -705,8 +828,12 @@ class MainWindow(QMainWindow):
             return
         index = item.data(Qt.UserRole)
         if index is not None:
+            self._sky_display_index = None
             self.apply_learned_defaults(index)
             self.show_preview(index)
+        else:
+            self._sky_display_index = None
+        self.update_sky_buttons()
 
     def show_preview(self, index):
         """Display bracket `index`, decoding it first if it is not cached yet."""
@@ -715,6 +842,7 @@ class MainWindow(QMainWindow):
             self.before_pane.clear_image()
             self.after_pane.clear_image()
             self.preview_status.setText(f"Bracket {index + 1} has not been fused yet.")
+            self.update_sky_buttons()
             return
         if index in self._preview_cache:
             self.display_preview(index, *self._preview_cache[index])
@@ -753,15 +881,18 @@ class MainWindow(QMainWindow):
         # way, but only paint it if it is still the bracket they are looking at.
         if index == self._preview_wanted:
             self.display_preview(index, before, after, sizes)
+        self.update_sky_buttons()
 
     def display_preview(self, index, before, after, sizes):
         before_path, after_path = self.results[index]
         self.before_pane.set_image(before)
         self.after_pane.set_image(after)
+        self._sky_display_index = None
         self.before_caption.setText(f"Before — {before_path.name} (middle exposure)")
         self.after_caption.setText(f"After — {after_path.name}")
         # Real file dimensions, not the scaled-to-fit preview the panes are showing.
         self.preview_status.setText(describe_sizes(index, *sizes, self._results_half_size.get(index, False)))
+        self.update_sky_buttons()
 
     def clear_previews(self):
         self.results = {}
@@ -771,11 +902,14 @@ class MainWindow(QMainWindow):
         self._post_pending = None
         self._results_half_size = {}
         self._scene_types = {}
+        self._sky_cache = {}
+        self._sky_display_index = None
         self.before_pane.clear_image()
         self.after_pane.clear_image()
         self.before_caption.setText("Before")
         self.after_caption.setText("After")
         self.preview_status.setText("Fuse a bracket, or click one that is already done.")
+        self.update_sky_buttons()
 
     @Slot()
     def on_preview_thread_finished(self):
@@ -830,21 +964,28 @@ class MainWindow(QMainWindow):
 
     def set_busy(self, busy, processing=False):
         self._busy = busy
-        self.input_button.setEnabled(not busy)
-        self.output_button.setEnabled(not busy and self.input_dir is not None)
-        self.half_size.setEnabled(not busy)
-        self.align.setEnabled(not busy)
-        self.straighten.setEnabled(not busy)
-        self.contrast.setEnabled(not busy)
-        self.saturation.setEnabled(not busy)
+        locked = busy or self._sky_thread is not None
+        self.input_button.setEnabled(not locked)
+        self.output_button.setEnabled(not locked and self.input_dir is not None)
+        self.half_size.setEnabled(not locked)
+        self.align.setEnabled(not locked)
+        self.straighten.setEnabled(not locked)
+        self.contrast.setEnabled(not locked)
+        self.saturation.setEnabled(not locked)
         self.process_button.setText("Cancel" if processing else "Process")
         # A running post-processing pass is writing a JPEG that Process would overwrite.
         self.process_button.setEnabled(
-            processing or (not busy and bool(self.brackets) and self._post_thread is None))
+            processing or (not locked and bool(self.brackets) and self._post_thread is None))
+        self.update_sky_buttons()
 
     def closeEvent(self, event):
         self._post_timer.stop()
         self._post_pending = None
+        if self._sky_thread is not None:
+            self._close_pending = True
+            self.status.setText("Closing after sky preview finishes…")
+            event.ignore()
+            return
         if self._post_thread is not None:
             # Let the JPEG finish writing rather than leave a truncated file; closes when done.
             self._close_pending = True
