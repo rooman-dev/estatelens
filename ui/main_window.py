@@ -50,10 +50,11 @@ from core.prototype import (
 from processing.scenesense import classify_scene, is_exterior
 from processing.sky_preview import mask_overlay, predict_sky_probability
 from processing.sky_replace import composite_sky, read_rgb, save_sky_version
+from ui.style import apply_theme
 
-WARNING_COLOR = QColor("#b36b00")
-OK_COLOR = QColor("#2e7d32")
-FAIL_COLOR = QColor("#c62828")
+WARNING_COLOR = QColor("#faa61a")
+OK_COLOR = QColor("#3ba55d")
+FAIL_COLOR = QColor("#ed4245")
 PREVIEW_LONG_EDGE = 1200
 FUSED_CACHE_SIZE = 4        # a 24MP fused RGB image is ~72 MB
 SLIDER_SCALE = 100          # QSlider holds ints; value 150 means 1.50
@@ -475,6 +476,7 @@ class MainWindow(QMainWindow):
         self.output_button.setEnabled(False)
 
         self.list = QListWidget()
+        self.list.setObjectName("BracketList")
         self.half_size = QCheckBox("Half size (faster, less memory)")
         self.align = QCheckBox("Align frames")
         self.align.setChecked(True)
@@ -488,17 +490,25 @@ class MainWindow(QMainWindow):
             label.setMinimumWidth(32)
         self.update_slider_labels()
         self.process_button = QPushButton("Process")
+        self.process_button.setObjectName("PrimaryButton")
         self.process_button.setEnabled(False)
         self.progress = QProgressBar()
+        self.progress.setObjectName("MainProgress")
         self.progress.setFormat("%v / %m brackets")
         self.progress.setValue(0)
         self.status = QLabel("Choose a folder of RAW files.")
+        self.status.setObjectName("StatusLabel")
 
         self.before_pane = ImagePane("No preview")
+        self.before_pane.setObjectName("PreviewImageLabel")
         self.after_pane = ImagePane("No preview")
+        self.after_pane.setObjectName("PreviewImageLabel")
         self.before_caption = QLabel("Before")
+        self.before_caption.setObjectName("PaneCaption")
         self.after_caption = QLabel("After")
+        self.after_caption.setObjectName("PaneCaption")
         self.preview_status = QLabel("Fuse a bracket, or click one that is already done.")
+        self.preview_status.setObjectName("PreviewCaptionLabel")
         self.preview_status.setWordWrap(True)
         self.sky_button = QPushButton("Preview sky mask")
         self.sky_button.setEnabled(False)
@@ -512,13 +522,31 @@ class MainWindow(QMainWindow):
             caption.setAlignment(Qt.AlignCenter)
 
         rows = QVBoxLayout()
+        rows.setContentsMargins(0, 0, 0, 0)
+        rows.setSpacing(0)
+
+        header = QWidget()
+        header.setObjectName("AppHeader")
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(16, 0, 16, 0)
+        title_label = QLabel("EstateLens")
+        title_label.setObjectName("AppTitleLabel")
+        header_layout.addWidget(title_label)
+        header_layout.addStretch(1)
+        rows.addWidget(header)
+
+        body = QVBoxLayout()
+        body.setContentsMargins(12, 12, 12, 12)
+        body.setSpacing(10)
+        rows.addLayout(body)
+
         for label_text, label, button in (("Input:", self.input_label, self.input_button),
                                           ("Output:", self.output_label, self.output_button)):
             row = QHBoxLayout()
             row.addWidget(QLabel(label_text))
             row.addWidget(label, 1)
             row.addWidget(button)
-            rows.addLayout(row)
+            body.addLayout(row)
         panes = QHBoxLayout()
         for caption, pane in ((self.before_caption, self.before_pane),
                               (self.after_caption, self.after_pane)):
@@ -538,15 +566,17 @@ class MainWindow(QMainWindow):
             preview_controls.addWidget(self.photo_button)
             preview_rows.addLayout(preview_controls)
         preview_panel = QWidget()
+        preview_panel.setObjectName("PreviewPanel")
         preview_panel.setLayout(preview_rows)
 
         splitter = QSplitter(Qt.Horizontal)
+        splitter.setObjectName("MainSplitter")
         splitter.addWidget(self.list)
         splitter.addWidget(preview_panel)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         splitter.setSizes([320, 780])
-        rows.addWidget(splitter, 1)
+        body.addWidget(splitter, 1)
         options = QHBoxLayout()
         options.addWidget(self.half_size)
         options.addWidget(self.align)
@@ -559,9 +589,9 @@ class MainWindow(QMainWindow):
             options.addWidget(value)
         options.addStretch(1)
         options.addWidget(self.process_button)
-        rows.addLayout(options)
-        rows.addWidget(self.progress)
-        rows.addWidget(self.status)
+        body.addLayout(options)
+        body.addWidget(self.progress)
+        body.addWidget(self.status)
         central = QWidget()
         central.setLayout(rows)
         self.setCentralWidget(central)
@@ -1175,6 +1205,7 @@ class MainWindow(QMainWindow):
 
 def run_app():
     app = QApplication(sys.argv)
+    apply_theme(app)
     window = MainWindow()
     window.show()
     return app.exec()
